@@ -17,6 +17,7 @@ from .megabatch_base import (
 )
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 from .opt_utils import AsyncTask, to_local
+from .scalar_opts import adamw_update_foreach_syre_async
 
 
 def _validate_syre_kwargs(
@@ -65,6 +66,30 @@ def _validate_syre_kwargs(
             )
 
 
+def _check_syre_triton_available():
+    """Raise ``ImportError`` if the SYRE Triton module isn't importable.
+
+    Uses ``importlib.import_module`` rather than ``from . import syre``
+    so the lookup honors ``sys.modules`` entries set to ``None`` (the
+    standard "module deliberately unavailable" sentinel used by the
+    tests). With ``from . import syre`` the bytecode falls back to
+    ``getattr(package, 'syre')``, which returns a cached module object
+    set as a package attribute by an earlier successful import even
+    when ``sys.modules`` has been patched.
+
+    The error message is tailored for the ``syre_wd=True`` user path;
+    callers only invoke this when SYRE is actually being requested.
+    """
+    import importlib
+    try:
+        importlib.import_module(".syre", __package__)
+    except ImportError as e:
+        raise ImportError(
+            "syre_wd=True requires triton. Install dion's optional "
+            "triton extra (or install triton directly) and retry."
+        ) from e
+
+
 class Aurora(DistributedOrthoBase):
     """
     Distributed Aurora optimizer for PyTorch FSDP2. Also compatible with DDP.
@@ -111,6 +136,12 @@ class Aurora(DistributedOrthoBase):
             (``theta <- theta - lr*wd*(theta - theta_0)``) in place of the
             standard decoupled WD step. ``theta_0`` is regenerated from a
             stored per-parameter PRNG seed each step. Requires CUDA + triton.
+            Applies to both ``algorithm="aurora"`` and ``algorithm="adamw"``
+            groups; on the AdamW path the SYRE step runs after the bias-
+            correction math so the cautious mask (when ``cautious_wd=True``)
+            uses the update direction ``M_new / (sqrt(V_new/bc2) + eps)``,
+            matching segyges/aurora. ``algorithm="lion"`` + ``syre_wd=True``
+            is refused (not wired).
         syre_std: Required when ``syre_wd=True``. Scale of ``theta_0``. No
             empirical default -- if you want to couple this to your init
             magnitude, compute and pass it explicitly.
@@ -174,15 +205,10 @@ class Aurora(DistributedOrthoBase):
 
         # Gate the triton import at construction time when SYRE is on, so
         # users without triton don't have to wait until the first step
-        # to find out it isn't available.
+        # to find out it isn't available. ``add_param_group`` re-runs the
+        # same gate for groups added after construction.
         if syre_wd:
-            try:
-                from . import syre as _syre_module  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "syre_wd=True requires triton. Install dion's optional "
-                    "triton extra (or install triton directly) and retry."
-                ) from e
+            _check_syre_triton_available()
 
         defaults = dict(
             lr=lr,
@@ -230,6 +256,12 @@ class Aurora(DistributedOrthoBase):
         """Validate SYRE-related kwargs on each new group, mirroring the
         construction-time checks. Defaults are filled in by torch's base
         ``add_param_group`` from ``self.defaults`` if not present.
+
+        Also gates the triton import for groups added later with
+        ``syre_wd=True`` (the ``__init__`` gate only covers groups
+        present at construction), and refuses
+        ``algorithm="lion" + syre_wd=True`` (Lion + SYRE is not wired;
+        see :meth:`_create_lion_tasks` for the same guard at step time).
         """
         syre_wd = param_group.get("syre_wd", self.defaults["syre_wd"])
         syre_std = param_group.get("syre_std", self.defaults["syre_std"])
@@ -238,6 +270,15 @@ class Aurora(DistributedOrthoBase):
         )
         d_bound = param_group.get("d_bound", self.defaults["d_bound"])
         _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+
+        algorithm = param_group.get("algorithm", self.defaults["algorithm"])
+        if syre_wd and algorithm == "lion":
+            raise NotImplementedError(
+                "syre_wd=True with algorithm='lion' is not supported. "
+                "SYRE is wired for algorithm='aurora' and 'adamw' only."
+            )
+        if syre_wd:
+            _check_syre_triton_available()
         super().add_param_group(param_group)
 
     def _get_or_init_syre_seeds(
@@ -417,6 +458,88 @@ class Aurora(DistributedOrthoBase):
                         **megabatch_args,
                     )
                 )
+
+    def _create_adamw_tasks(
+        self, param_groups: List[dict]
+    ) -> Generator["AsyncTask", None, None]:
+        """AdamW task creation with SYRE support.
+
+        Groups without ``syre_wd=True`` are delegated to the parent's
+        standard AdamW path (``torch._fused_adamw_``-backed in
+        ``scalar_opts.adamw_update_foreach``). Groups with
+        ``syre_wd=True`` are routed through
+        :func:`dion.scalar_opts.adamw_update_foreach_syre_async`, which
+        runs the AdamW math eagerly so the post-bias-correction update
+        direction is available as the cautious-SYRE mask source.
+        """
+        standard_groups = [g for g in param_groups if not g.get("syre_wd", False)]
+        syre_groups = [g for g in param_groups if g.get("syre_wd", False)]
+
+        # Delegate the no-SYRE path so we don't fork the fast fused path.
+        yield from super()._create_adamw_tasks(standard_groups)
+
+        for group in syre_groups:
+            assert group["algorithm"] == "adamw"
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            gradients = [p.grad for p in params]
+            states = [self._get_or_initialize_state(p, "adamw") for p in params]
+            momentums = [s["momentum"] for s in states]
+            variances = [s["variance"] for s in states]
+
+            advanced_removal = group["advanced_removal"]
+            d_bound = float(group["d_bound"])
+            syre_std = float(group["syre_std"])
+
+            syre_seeds1: List[int] = []
+            syre_seeds2: List[int] = []
+            syre_offset_bases: List[int] = []
+            for p in params:
+                s1, s2 = self._get_or_init_syre_seeds(p, advanced_removal)
+                syre_seeds1.append(s1)
+                syre_seeds2.append(s2)
+                syre_offset_bases.append(self._compute_syre_offset_base(p))
+
+            yield AsyncTask(
+                adamw_update_foreach_syre_async(
+                    X=to_local(params),
+                    G=to_local(gradients),
+                    M=to_local(momentums),
+                    V=to_local(variances),
+                    lr=torch.tensor(group["lr"]),
+                    beta1=torch.tensor(group["beta1"]),
+                    beta2=torch.tensor(group["beta2"]),
+                    weight_decay=torch.tensor(group["weight_decay"]),
+                    step=torch.tensor(group["step"]),
+                    epsilon=torch.tensor(group["epsilon"]),
+                    cautious_wd=group.get("cautious_wd", False),
+                    syre_seeds1=syre_seeds1,
+                    syre_seeds2=syre_seeds2,
+                    syre_std=syre_std,
+                    syre_offset_bases=syre_offset_bases,
+                    advanced_removal=advanced_removal,
+                    d_bound=d_bound,
+                )
+            )
+
+    def _create_lion_tasks(
+        self, param_groups: List[dict]
+    ) -> Generator["AsyncTask", None, None]:
+        """Refuse ``syre_wd=True`` on Lion groups (not wired).
+
+        ``add_param_group`` already raises if a Lion group is added with
+        ``syre_wd=True``, but a user could mutate the group's
+        ``syre_wd`` after the fact. Catching it again here keeps the
+        "silently no-ops" failure mode closed.
+        """
+        for group in param_groups:
+            if group.get("syre_wd", False):
+                raise NotImplementedError(
+                    "syre_wd=True with algorithm='lion' is not supported. "
+                    "SYRE is wired for algorithm='aurora' and 'adamw' only."
+                )
+        yield from super()._create_lion_tasks(param_groups)
 
 
 def aurora_update_megabatch_async(

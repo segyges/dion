@@ -84,24 +84,70 @@ def _validate_syre_kwargs(
             )
 
 
+# Smallest ``d_bound`` we let through when SYRE-AR is on. The SYRE
+# kernel uses the additive form (computes ``diff*(1+xi)`` as
+# ``diff + diff*xi`` rather than forming ``1+xi`` in fp32), so the
+# representation-side pigeonhole on ``D`` is avoided -- ``xi`` is
+# precise near 0 down to denormals. The remaining concern is purely
+# *meaningfulness*: at very small ``d_bound``, the per-element AR
+# contribution ``gamma * diff * xi`` falls so far below fp32 ulp at
+# typical weight magnitudes that it does not accumulate to a
+# meaningful value even over a full WD half-life. 1e-6 is the
+# rough threshold below which AR has no measurable effect on training
+# for any realistic schedule (lr ~ 1e-3, wd ~ 0.1, ~30k step horizons).
+_SYRE_AR_D_BOUND_FP32_FLOOR = 1e-6
+
+
 def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
     """Auto-resolve ``d_bound=None`` to ``0.1 * syre_std`` when both
-    SYRE and AR are on; otherwise pass through unchanged.
+    SYRE and AR are on; otherwise pass through unchanged. Also rejects
+    a resolved ``d_bound`` so small that AR has no measurable effect.
 
     The paper (Ziyin et al., 2024) only proves AR's symmetry-removal
     strength under ``sigma_D = o(sigma_0)`` (Theorem 3). For
     ``D_ii ~ Uniform(1 - d_bound, 1 + d_bound)``, ``sigma_D = d_bound /
     sqrt(3)``. Setting ``d_bound = 0.1 * syre_std`` gives
     ``sigma_D / sigma_0 ~ 0.058`` -- comfortably in the perturbative
-    regime, while keeping D entries numerically distinguishable in
-    fp32/bf16. Users who want a different ratio can pass ``d_bound``
+    regime. Users who want a different ratio can pass ``d_bound``
     explicitly.
+
+    Floor (1e-6): a positive but very small ``d_bound`` is rejected
+    with ``ValueError`` when AR is enabled. The kernel uses the
+    additive form ``diff + diff*xi``, so the per-element AR multiplier
+    has full fp32 precision (no pigeonhole on D values). But at
+    ``d_bound < 1e-6``, the per-element AR contribution
+    ``gamma * diff * xi`` is so small relative to fp32 ulp at typical
+    weight magnitudes that it does not accumulate to a measurable
+    value over realistic training horizons -- AR becomes silently
+    irrelevant. This commonly happens if the user picks an unusually
+    small ``syre_std`` (<= ~1e-5) and lets ``d_bound`` auto-resolve,
+    or passes a tiny explicit ``d_bound``. The fix is to pick a larger
+    ``syre_std`` (paper recommends ``0.01 / sqrt(d)``) or an explicit
+    positive ``d_bound >= 1e-6``.
 
     Must be called *after* ``_validate_syre_kwargs`` so we can rely on
     ``syre_std`` being a positive float when SYRE is on.
     """
     if syre_wd and advanced_removal and d_bound is None:
-        return 0.1 * float(syre_std)
+        d_bound = 0.1 * float(syre_std)
+    if (
+        syre_wd
+        and advanced_removal
+        and d_bound is not None
+        and 0.0 < float(d_bound) < _SYRE_AR_D_BOUND_FP32_FLOOR
+    ):
+        raise ValueError(
+            f"d_bound={d_bound!r} is below the AR-meaningfulness floor "
+            f"({_SYRE_AR_D_BOUND_FP32_FLOOR:.0e}) for SYRE-AR: at this "
+            "scale the per-element AR contribution gamma*diff*xi does "
+            "not accumulate to a measurable value over realistic "
+            "training horizons (fp32 storage ulp at typical weight "
+            "magnitudes dominates). If you let d_bound auto-resolve "
+            f"(d_bound=None), this means your syre_std ({syre_std!r}) "
+            "is too small -- the paper recommends "
+            "syre_std = 0.01 / sqrt(d). Otherwise pass an explicit "
+            "d_bound >= 1e-6."
+        )
     return d_bound
 
 

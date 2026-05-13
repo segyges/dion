@@ -18,7 +18,10 @@ Math:
   ``d ~ Uniform(1 - d_bound, 1 + d_bound)`` (per element, keyed by
   ``seed2``) before the decay step. Breaks the continuous symmetries
   that basic SYRE / L2 cannot resolve, by giving each coordinate a
-  slightly different decay coefficient.
+  slightly different decay coefficient. Implementation note:
+  computed in *additive form* as ``diff + diff*xi`` with
+  ``xi = d - 1 ~ Uniform(-d_bound, +d_bound)``, never materializing
+  ``(1 + xi)`` in fp32. See "Pigeonhole avoidance" below.
 * **Cautious SYRE.** Gates the SYRE diff element-wise by the
   cautious-WD mask ``(u * theta >= 0)``, where ``u`` is the post-orth
   update tensor that the optimizer is about to subtract from ``theta``
@@ -30,6 +33,69 @@ Math:
 
 The decay coefficient ``gamma`` is computed by the caller. Aurora's
 contract is ``gamma = lr * weight_decay``.
+
+Pigeonhole avoidance (additive form)
+------------------------------------
+
+The paper requires ``D_ii`` (i.e. ``1 + xi_i``) all distinct. A naive
+implementation forms ``d = 1 + xi`` in fp32 and multiplies
+``diff * d``. fp32 ulp at 1.0 is ~1.2e-7, so the window of
+representable ``(1 + xi)`` values has only ``2*d_bound / 1.2e-7``
+distinct fp32 levels -- a few hundred at typical ``d_bound`` ~ 3e-5,
+far fewer than the millions of elements in a real layer. By
+pigeonhole this produces massive collisions, and ~half the elements
+get ``d`` rounded to *exactly* 1.0 (giving them zero AR contribution
+per step, not merely sub-ulp).
+
+We instead compute the algebraically-identical ``diff * (1 + xi)``
+as ``diff + diff * xi``, never forming ``(1 + xi)``:
+
+* ``xi`` lives in ``[-d_bound, +d_bound]`` near 0. fp32 ulp near
+  ``d_bound ~ 3e-5`` is ~1.2e-12, so the window admits ~5e7 distinct
+  fp32 values -- enough to keep ``xi_i`` distinct per element well
+  past typical layer sizes.
+* ``diff * xi`` is a multiplication, which preserves the relative
+  precision of ``xi`` (rounding happens at the product's magnitude,
+  not near 1.0).
+* ``diff + diff*xi``: ``diff*xi`` is added at ``diff``'s magnitude,
+  where ulp is much smaller than ulp(1.0). The contribution survives.
+
+The mathematical distribution of the implicit ``D`` matrix is
+identical to the naive form; the rearrangement only changes which
+intermediate values the fp32 representation has to store.
+
+Storage-dtype precision
+-----------------------
+
+The kernel does all arithmetic in fp32 (``theta_f32 = theta.to(fp32)``)
+but writes the result back to the parameter's storage dtype. The
+storage dtype -- *not* the gradient dtype, autocast context, or
+anything else upstream -- is what determines whether SYRE's per-step
+contribution survives.
+
+Rough order-of-magnitude (with ``lr=3e-4``, ``wd=0.1``,
+``sigma_0 = 0.01/sqrt(d)``, weight magnitude ``~0.03``):
+
+* **fp32 storage** (incl. fp32-master / bf16-grad mixed precision):
+  basic SYRE contributes ~250 fp32-ulps per step, AR contributes
+  ~8e-3 fp32-ulps per step. Basic SYRE registers cleanly; AR is
+  sub-ulp per step but accumulates deterministically (the per-element
+  AR multiplier is fixed by Philox seed, not redrawn step-to-step),
+  reaching ~80 ulps over one WD half-life. **Both behave as the paper
+  intends.**
+
+* **bf16 storage** (pure-bf16 training, 8-bit optimizers holding
+  bf16 params): basic SYRE contributes ~4e-3 bf16-ulps per step --
+  still accumulates over long horizons under round-to-nearest-even,
+  but at heavily attenuated effective ``gamma``. AR contributes
+  ~1e-7 bf16-ulps per step and **never crosses 1 ulp at realistic
+  step counts** -- it is effectively a no-op. If you need SYRE/AR to
+  behave as documented, use fp32 master weights or stochastic
+  rounding on the writeback.
+
+Numbers scale predictably with layer init magnitude and ``gamma``;
+AR's signal-to-basic-SYRE ratio is ``d_bound ~ sigma_0``, which is
+why bf16's ~7-bit relative ulp swallows AR regardless of ``gamma``.
 """
 
 from typing import Optional
@@ -57,8 +123,15 @@ def _syre_wd_kernel(
     diff = theta_f32 - theta_0
 
     if ADVANCED_REMOVAL:
-        d = tl.rand(seed2, global_offsets) * (2.0 * d_bound) + (1.0 - d_bound)
-        diff = diff * d
+        # Additive form: compute diff*(1+xi) as diff + diff*xi rather
+        # than forming (1+xi) explicitly. xi lives near 0 with full
+        # fp32 precision (~1e7 distinct values in our window at typical
+        # d_bound); (1+xi) computed explicitly would round many distinct
+        # xi to the same fp32 value near 1.0 (ulp ~1.2e-7), collapsing
+        # AR to zero for ~half the elements. See module docstring
+        # "Pigeonhole avoidance" section for the full derivation.
+        xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
+        diff = diff + diff * xi
 
     result = theta_f32 - gamma * diff
     tl.store(X_ptr + offsets, result.to(theta.dtype), mask=mask)
@@ -83,8 +156,9 @@ def _syre_wd_cautious_kernel(
     diff = theta_f32 - theta_0
 
     if ADVANCED_REMOVAL:
-        d = tl.rand(seed2, global_offsets) * (2.0 * d_bound) + (1.0 - d_bound)
-        diff = diff * d
+        # See additive-form note in _syre_wd_kernel above.
+        xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
+        diff = diff + diff * xi
 
     cautious_mask = tl.where(u_f32 * theta_f32 >= 0.0, 1.0, 0.0)
     result = theta_f32 - gamma * diff * cautious_mask

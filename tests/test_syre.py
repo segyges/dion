@@ -215,6 +215,77 @@ def test_add_param_group_d_bound_zero_with_ar_raises():
         })
 
 
+def test_d_bound_below_fp32_floor_with_ar_raises():
+    """An explicit positive but tiny ``d_bound`` (below ~1e-6) combined
+    with ``advanced_removal=True`` is rejected: fp32 precision around
+    1.0 (ulp ~1.2e-7) makes the Uniform(1-d_bound, 1+d_bound) multiplier
+    collapse to ~1 and AR silently no-ops. The error message must point
+    at the fp32 floor so the user knows why.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    with pytest.raises(ValueError, match="AR-meaningfulness floor"):
+        Aurora(
+            [p], syre_wd=True, syre_std=0.01,
+            advanced_removal=True, d_bound=1e-7,
+        )
+
+
+def test_d_bound_at_fp32_floor_with_ar_allowed():
+    """The boundary case ``d_bound == 1e-6`` (the floor) is allowed --
+    the check is strict ``<``. Sanity-guards against off-by-one error
+    in the threshold.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = Aurora(
+        [p], syre_wd=True, syre_std=0.01,
+        advanced_removal=True, d_bound=1e-6,
+    )
+    assert opt.param_groups[0]["d_bound"] == pytest.approx(1e-6)
+
+
+def test_d_bound_below_fp32_floor_with_ar_off_is_allowed():
+    """Tiny ``d_bound`` is only rejected when AR is on. With AR off
+    the kernel ignores ``d_bound`` entirely so any nonnegative value
+    (including tiny ones) is fine.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = Aurora(
+        [p], syre_wd=True, syre_std=0.01,
+        advanced_removal=False, d_bound=1e-9,
+    )
+    assert opt.param_groups[0]["d_bound"] == pytest.approx(1e-9)
+
+
+def test_syre_std_too_small_autoresolves_below_floor_and_raises():
+    """The classic footgun: user picks a very small ``syre_std`` and
+    lets ``d_bound`` auto-resolve. With ``syre_std=1e-6``, the resolved
+    ``d_bound = 0.1 * syre_std = 1e-7`` is below the fp32 floor, so
+    construction must raise (pointing at ``syre_std`` as the cause).
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    with pytest.raises(ValueError, match="syre_std"):
+        Aurora(
+            [p], syre_wd=True, syre_std=1e-6,
+            advanced_removal=True,
+            # d_bound omitted -- auto-resolves to 1e-7, below floor
+        )
+
+
+def test_add_param_group_d_bound_below_fp32_floor_raises():
+    """The fp32-floor rejection must fire at ``add_param_group`` time
+    too, not just at construction.
+    """
+    p1 = torch.nn.Parameter(torch.randn(8, 4))
+    p2 = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Aurora([p1])
+    with pytest.raises(ValueError, match="AR-meaningfulness floor"):
+        opt.add_param_group({
+            "params": [p2],
+            "syre_wd": True, "syre_std": 0.02,
+            "advanced_removal": True, "d_bound": 1e-8,
+        })
+
+
 # ---------------------------------------------------------------------------
 # 2. Back-compat: syre_wd=False is bit-equal to no-SYRE-kwargs.
 # ---------------------------------------------------------------------------
@@ -410,6 +481,57 @@ def test_syre_advanced_removal_collapses_at_d_bound_zero():
         seed2=99, d_bound=0.0, advanced_removal=True, offset_base=0,
     )
     torch.testing.assert_close(theta_basic, theta_ar, atol=1e-6, rtol=1e-6)
+
+
+@gpu_only
+def test_syre_advanced_removal_additive_form_preserves_distinctness():
+    """The AR kernel uses the additive form ``diff + diff*xi`` rather
+    than forming ``(1 + xi)`` in fp32. Under the additive form, every
+    element's per-element xi retains its full fp32 precision near 0,
+    so the per-element AR contributions are distinct across nearly all
+    elements even at small ``d_bound``.
+
+    Under the naive multiplicative form, ``round_fp32(1 + xi)`` only
+    has ``~2*d_bound / ulp(1.0)`` ~ 167 distinct values at
+    ``d_bound=1e-5`` -- and a layer with thousands of elements would
+    have massive collisions, violating the paper's "all D_ii distinct"
+    hypothesis at the implementation level.
+
+    Setup: ``std=0`` makes ``theta_0 = 0`` and ``diff = theta``
+    exactly, so the AR-only contribution simplifies analytically to
+    ``-gamma * theta * xi``. We recover xi per element and count
+    distinct values.
+    """
+    from dion.syre import syre_wd_inplace
+
+    torch.manual_seed(0)
+    n = 65536
+    # Well-separated thetas so per-element xi resolves at fp32.
+    theta_orig = torch.rand(n, device="cuda") + 0.5  # in [0.5, 1.5)
+
+    theta_ar = theta_orig.clone()
+    syre_wd_inplace(
+        theta_ar, gamma=1.0, seed1=11, std=0.0,
+        seed2=22, d_bound=1e-5, advanced_removal=True, offset_base=0,
+    )
+    # With gamma=1 and std=0:
+    #   result_AR = theta - 1 * (theta + theta * xi) = -theta * xi
+    # so xi_recovered = -result_AR / theta_orig.
+    xi_recovered = -theta_ar / theta_orig
+
+    # Sanity: recovered xi in [-d_bound, +d_bound] modulo a tiny
+    # rounding margin.
+    assert xi_recovered.abs().max().item() < 1.5e-5
+
+    # Distinctness: under the additive form, ~all 65536 elements
+    # should have distinct xi. The naive multiplicative form would
+    # cap this at ~167 (= 2*d_bound / ulp(1.0)).
+    n_distinct = int(xi_recovered.unique().numel())
+    assert n_distinct > 10_000, (
+        f"Expected nearly all {n} elements to have distinct xi under "
+        f"additive form; got {n_distinct} distinct values. The naive "
+        "multiplicative form would have produced ~167."
+    )
 
 
 # ---------------------------------------------------------------------------

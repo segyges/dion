@@ -28,6 +28,14 @@ def _validate_syre_kwargs(
     Called from ``Aurora.__init__`` and ``Aurora.add_param_group`` so
     typos and bad types are caught at construction / mutation time
     rather than at the first SYRE step.
+
+    ``d_bound`` may be ``None`` (auto-resolve at the call site to
+    ``0.1 * syre_std`` when SYRE-AR is on) or a numeric in ``[0, 1)``.
+    Passing an explicit ``d_bound == 0`` together with
+    ``advanced_removal=True`` is rejected as operator error: it
+    collapses ``D`` to the identity and defeats the entire purpose of
+    advanced removal. Use ``advanced_removal=False`` if you don't want
+    AR, or pick a positive ``d_bound``.
     """
     if not isinstance(syre_wd, bool):
         raise TypeError(
@@ -38,14 +46,24 @@ def _validate_syre_kwargs(
             f"advanced_removal must be a bool, got "
             f"{type(advanced_removal).__name__}: {advanced_removal!r}"
         )
-    if not isinstance(d_bound, (int, float)) or isinstance(d_bound, bool):
-        raise TypeError(
-            f"d_bound must be a float in [0, 1), got "
-            f"{type(d_bound).__name__}: {d_bound!r}"
-        )
-    if not (0.0 <= float(d_bound) < 1.0):
+    if d_bound is not None:
+        if not isinstance(d_bound, (int, float)) or isinstance(d_bound, bool):
+            raise TypeError(
+                f"d_bound must be a float in [0, 1) or None, got "
+                f"{type(d_bound).__name__}: {d_bound!r}"
+            )
+        if not (0.0 <= float(d_bound) < 1.0):
+            raise ValueError(
+                f"d_bound must be in [0, 1) or None, got {d_bound}"
+            )
+    if syre_wd and advanced_removal and d_bound is not None and float(d_bound) == 0.0:
         raise ValueError(
-            f"d_bound must be in [0, 1), got {d_bound}"
+            "d_bound=0 with advanced_removal=True is rejected: the "
+            "Uniform(1-0, 1+0) multiplier collapses D to the identity, "
+            "which defeats AR's symmetry-breaking purpose. Either set "
+            "advanced_removal=False, omit d_bound (auto-resolves to "
+            "0.1 * syre_std per Theorem 3's sigma_D = o(sigma_0) "
+            "condition), or pass a positive d_bound."
         )
     if syre_wd:
         if syre_std is None:
@@ -64,6 +82,27 @@ def _validate_syre_kwargs(
             raise ValueError(
                 f"syre_std must be a positive float, got {syre_std}"
             )
+
+
+def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
+    """Auto-resolve ``d_bound=None`` to ``0.1 * syre_std`` when both
+    SYRE and AR are on; otherwise pass through unchanged.
+
+    The paper (Ziyin et al., 2024) only proves AR's symmetry-removal
+    strength under ``sigma_D = o(sigma_0)`` (Theorem 3). For
+    ``D_ii ~ Uniform(1 - d_bound, 1 + d_bound)``, ``sigma_D = d_bound /
+    sqrt(3)``. Setting ``d_bound = 0.1 * syre_std`` gives
+    ``sigma_D / sigma_0 ~ 0.058`` -- comfortably in the perturbative
+    regime, while keeping D entries numerically distinguishable in
+    fp32/bf16. Users who want a different ratio can pass ``d_bound``
+    explicitly.
+
+    Must be called *after* ``_validate_syre_kwargs`` so we can rely on
+    ``syre_std`` being a positive float when SYRE is on.
+    """
+    if syre_wd and advanced_removal and d_bound is None:
+        return 0.1 * float(syre_std)
+    return d_bound
 
 
 def _check_syre_triton_available():
@@ -150,7 +189,12 @@ class Aurora(DistributedOrthoBase):
             decay step, breaking continuous symmetries the basic form leaves
             untouched. No-op when ``syre_wd=False``.
         d_bound: Half-width of the SYRE-AR uniform interval. Ignored unless
-            ``advanced_removal=True``. Must lie in ``[0, 1)``.
+            ``advanced_removal=True``. ``None`` (default) auto-resolves to
+            ``0.1 * syre_std`` so ``sigma_D / sigma_0 ~ 0.058``, satisfying
+            the ``sigma_D = o(sigma_0)`` precondition of Theorem 3 in the
+            SYRE paper (arXiv:2408.15495). Pass a positive float to override.
+            An explicit ``d_bound=0`` with ``advanced_removal=True`` is
+            rejected as operator error -- it collapses D to the identity.
         use_triton: Whether to use the Triton Newton-Schulz kernel.
         use_polar_express: Whether to use Polar Express for the base polar.
         newton_schulz_func: Optional custom base polar function. Aurora wraps
@@ -178,7 +222,7 @@ class Aurora(DistributedOrthoBase):
         syre_wd: bool = False,
         syre_std: Optional[float] = None,
         advanced_removal: bool = False,
-        d_bound: float = 0.01,
+        d_bound: Optional[float] = None,
         use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
@@ -202,6 +246,9 @@ class Aurora(DistributedOrthoBase):
         if pp_beta < 0.0:
             raise ValueError(f"Invalid pp_beta: {pp_beta}")
         _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+        d_bound = _resolve_syre_d_bound(
+            syre_wd, syre_std, advanced_removal, d_bound,
+        )
 
         # Gate the triton import at construction time when SYRE is on, so
         # users without triton don't have to wait until the first step
@@ -268,8 +315,20 @@ class Aurora(DistributedOrthoBase):
         advanced_removal = param_group.get(
             "advanced_removal", self.defaults["advanced_removal"]
         )
-        d_bound = param_group.get("d_bound", self.defaults["d_bound"])
+        # ``None`` is meaningful here ("auto-resolve"); use ``in`` rather
+        # than ``.get(...)`` so an explicitly-passed ``d_bound=None`` is
+        # honored instead of being clobbered by the default.
+        d_bound = (
+            param_group["d_bound"] if "d_bound" in param_group
+            else self.defaults["d_bound"]
+        )
         _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+        d_bound = _resolve_syre_d_bound(
+            syre_wd, syre_std, advanced_removal, d_bound,
+        )
+        # Write the resolved value back so the group dict the base class
+        # ends up storing has the auto-resolved float, not ``None``.
+        param_group["d_bound"] = d_bound
 
         algorithm = param_group.get("algorithm", self.defaults["algorithm"])
         if syre_wd and algorithm == "lion":
@@ -360,7 +419,11 @@ class Aurora(DistributedOrthoBase):
 
             syre_wd = group["syre_wd"]
             advanced_removal = group["advanced_removal"]
-            d_bound = float(group["d_bound"])
+            # ``d_bound`` is ``None`` when AR is off (auto-resolution only
+            # fires when AR+SYRE are both on); fall back to 0.0 since the
+            # kernel won't read it in that branch anyway.
+            d_bound_raw = group["d_bound"]
+            d_bound = float(d_bound_raw) if d_bound_raw is not None else 0.0
             syre_std = float(group["syre_std"]) if syre_wd else 0.0
 
             update_args = dict(
@@ -489,7 +552,11 @@ class Aurora(DistributedOrthoBase):
             variances = [s["variance"] for s in states]
 
             advanced_removal = group["advanced_removal"]
-            d_bound = float(group["d_bound"])
+            # See note in ``_create_ortho_tasks``: ``d_bound`` may be ``None``
+            # when AR is off; the eager AdamW-SYRE path won't touch the AR
+            # branch in that case.
+            d_bound_raw = group["d_bound"]
+            d_bound = float(d_bound_raw) if d_bound_raw is not None else 0.0
             syre_std = float(group["syre_std"])
 
             syre_seeds1: List[int] = []

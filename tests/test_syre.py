@@ -112,7 +112,9 @@ def test_syre_defaults():
     assert g["syre_wd"] is False
     assert g["syre_std"] is None
     assert g["advanced_removal"] is False
-    assert g["d_bound"] == 0.01
+    # ``d_bound`` defaults to ``None`` (auto-resolves to ``0.1*syre_std``
+    # when AR+SYRE are both on). AR is off here, so it stays ``None``.
+    assert g["d_bound"] is None
 
 
 def test_add_param_group_validates_syre_kwargs():
@@ -126,6 +128,91 @@ def test_add_param_group_validates_syre_kwargs():
         opt.add_param_group({"params": [p2], "syre_wd": "yes"})
     with pytest.raises(ValueError, match="syre_std"):
         opt.add_param_group({"params": [p2], "syre_wd": True})
+
+
+def test_d_bound_autoresolves_to_one_tenth_syre_std():
+    """When ``advanced_removal=True`` and ``d_bound`` is left at its
+    default (``None``), Aurora should resolve it to ``0.1 * syre_std``
+    so ``sigma_D / sigma_0 ~ 0.058`` -- comfortably in the
+    ``sigma_D = o(sigma_0)`` regime that Theorem 3 of the SYRE paper
+    (arXiv:2408.15495) requires.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = Aurora(
+        [p], syre_wd=True, syre_std=0.02, advanced_removal=True,
+    )
+    g = opt.param_groups[0]
+    assert g["d_bound"] == pytest.approx(0.002)
+    # The defaults dict should also reflect the resolved value so groups
+    # added later inherit it.
+    assert opt.defaults["d_bound"] == pytest.approx(0.002)
+
+
+def test_d_bound_explicit_overrides_autoresolve():
+    """Passing an explicit ``d_bound`` must be honored verbatim even
+    when AR+SYRE are on (no auto-resolution).
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = Aurora(
+        [p], syre_wd=True, syre_std=0.02, advanced_removal=True,
+        d_bound=0.005,
+    )
+    assert opt.param_groups[0]["d_bound"] == 0.005
+
+
+def test_d_bound_zero_with_advanced_removal_raises():
+    """``d_bound=0`` + ``advanced_removal=True`` collapses ``D`` to the
+    identity and defeats AR's purpose entirely -- reject as operator
+    error rather than silently no-op'ing.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    with pytest.raises(ValueError, match="d_bound=0"):
+        Aurora(
+            [p], syre_wd=True, syre_std=0.02,
+            advanced_removal=True, d_bound=0.0,
+        )
+
+
+def test_d_bound_zero_with_advanced_removal_off_is_allowed():
+    """``d_bound=0`` is only an error when *combined* with
+    ``advanced_removal=True``. With AR off, ``d_bound`` is unused, so
+    any in-range value (including 0) is fine.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = Aurora([p], advanced_removal=False, d_bound=0.0)
+    assert opt.param_groups[0]["d_bound"] == 0.0
+
+
+def test_add_param_group_d_bound_autoresolves():
+    """Same auto-resolution must happen for groups added via
+    ``add_param_group``. The user passes ``d_bound=None`` (or omits it)
+    and gets ``0.1 * syre_std`` back.
+    """
+    p1 = torch.nn.Parameter(torch.randn(8, 4))
+    p2 = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Aurora([p1])  # construction with SYRE off
+    opt.add_param_group({
+        "params": [p2],
+        "syre_wd": True, "syre_std": 0.05,
+        "advanced_removal": True,
+        # d_bound omitted -- inherits None from defaults, resolves here
+    })
+    assert opt.param_groups[1]["d_bound"] == pytest.approx(0.005)
+
+
+def test_add_param_group_d_bound_zero_with_ar_raises():
+    """The ``d_bound=0`` + AR rejection must fire at ``add_param_group``
+    time too, not just at construction.
+    """
+    p1 = torch.nn.Parameter(torch.randn(8, 4))
+    p2 = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Aurora([p1])
+    with pytest.raises(ValueError, match="d_bound=0"):
+        opt.add_param_group({
+            "params": [p2],
+            "syre_wd": True, "syre_std": 0.02,
+            "advanced_removal": True, "d_bound": 0.0,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +232,7 @@ def test_syre_wd_false_bit_equal_to_baseline():
     opt_b = Aurora(
         [p_b], lr=0.05, weight_decay=0.01,
         syre_wd=False, syre_std=None,
-        advanced_removal=False, d_bound=0.01,
+        advanced_removal=False, d_bound=None,
     )
     for _ in range(3):
         g = torch.randn(16, 8) * 0.1
@@ -627,10 +714,10 @@ def test_syre_adamw_back_compat():
         {"params": [p_aur_b]},
         {"params": [p_adamw_b], "algorithm": "adamw",
          "syre_wd": False, "syre_std": None,
-         "advanced_removal": False, "d_bound": 0.01},
+         "advanced_removal": False, "d_bound": None},
     ], lr=0.05, weight_decay=0.01,
        syre_wd=False, syre_std=None,
-       advanced_removal=False, d_bound=0.01)
+       advanced_removal=False, d_bound=None)
 
     for _ in range(3):
         g_aur = torch.randn(8, 4, device="cuda") * 0.1

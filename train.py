@@ -29,6 +29,7 @@ from dion import Muon
 from dion import MuonReference
 from dion import Dion2
 from dion import NorMuon
+from dion import Aurora
 
 
 @dataclass
@@ -73,6 +74,10 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
+
+    # Aurora-specific (ignored by other optimizers)
+    pp_iterations: int = 2
+    pp_beta: float = 0.5
 
     # For printing out selection choice in Dion2
     verbose: bool = True
@@ -140,6 +145,18 @@ def parse_cli_args():
     )
     parser.add_argument("--mu", type=float, default=None, help="Momentum coefficient")
     parser.add_argument("--weight_decay", type=float, default=None, help="Weight decay")
+    parser.add_argument(
+        "--pp_iterations",
+        type=int,
+        default=None,
+        help="Aurora preconditioned-polar iterations",
+    )
+    parser.add_argument(
+        "--pp_beta",
+        type=float,
+        default=None,
+        help="Aurora row-norm preconditioning exponent",
+    )
     parser.add_argument(
         "--time_optimizer", action="store_true",
         help="Time fwd/bwd and optimizer step separately (adds cuda.synchronize between them)",
@@ -437,6 +454,37 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             nesterov=True,
             adjust_lr=hp.adjust_lr,
+            use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
+            use_triton=(not cli_args.no_triton),
+            use_polar_express=cli_args.use_polar_express,
+        )
+    elif hp.optimizer == "aurora":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for Aurora
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by Aurora.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"Aurora LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Aurora pp_iterations={hp.pp_iterations}, pp_beta={hp.pp_beta}")
+        print0(f"Distributed Aurora using: {comm_method}")
+        opt = Aurora(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            pp_iterations=hp.pp_iterations,
+            pp_beta=hp.pp_beta,
             use_gram_newton_schulz=cli_args.use_gram_newton_schulz,
             use_triton=(not cli_args.no_triton),
             use_polar_express=cli_args.use_polar_express,

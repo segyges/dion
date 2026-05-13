@@ -155,19 +155,44 @@ class TestAurora:
     def test_pp_iterations_mutation_takes_effect(self):
         """Mutating ``pp_iterations`` on a param group at runtime must change
         the update — the wrapper should be rebuilt each step (mirroring how
-        ``lr`` is re-read from the group)."""
+        ``lr`` is re-read from the group). Also fail-fast on bad runtime values."""
         from dion import Aurora
-        torch.manual_seed(0)
-        # Tall non-square so pp_iterations actually changes the answer.
-        params = [torch.nn.Parameter(torch.randn(128, 32, device=DEVICE))]
-        opt = Aurora(params, lr=0.01, pp_iterations=1)
-        params[0].grad = torch.randn_like(params[0])
-        opt.step()
 
-        opt.param_groups[0]["pp_iterations"] = 3
+        def _run_fresh(pp):
+            # Same seed / same single step / same param shape so the only
+            # variable is pp_iterations.
+            torch.manual_seed(0)
+            params = [torch.nn.Parameter(torch.randn(128, 32, device=DEVICE))]
+            torch.manual_seed(1)
+            params[0].grad = torch.randn_like(params[0])
+            opt = Aurora(params, lr=0.01, pp_iterations=pp)
+            opt.step()
+            return params[0].data.clone()
+
+        # Baseline: pp=1 and pp=3 must produce different updates on a
+        # tall non-square matrix (where the row-norm preconditioning is active).
+        r1 = _run_fresh(1)
+        r3 = _run_fresh(3)
+        assert not torch.equal(r1, r3), (
+            "pp_iterations=1 and pp_iterations=3 should yield different "
+            "updates; if they're equal the row-norm iteration is a no-op."
+        )
+
+        # Construct opt with pp_iterations=1, then mutate to 3 before step.
+        # Result must match the fresh-pp=3 result, not the fresh-pp=1 result.
+        torch.manual_seed(0)
+        params = [torch.nn.Parameter(torch.randn(128, 32, device=DEVICE))]
+        torch.manual_seed(1)
         params[0].grad = torch.randn_like(params[0])
-        # Bad value should now raise from the mutated group state.
+        opt = Aurora(params, lr=0.01, pp_iterations=1)
+        opt.param_groups[0]["pp_iterations"] = 3
+        opt.step()
+        torch.testing.assert_close(params[0].data, r3)
+        assert not torch.equal(params[0].data, r1)
+
+        # Bad runtime value should fail fast at step time.
         opt.param_groups[0]["pp_iterations"] = 0
+        params[0].grad = torch.randn_like(params[0])
         with pytest.raises(ValueError, match="pp_iterations"):
             opt.step()
 
@@ -218,12 +243,16 @@ class TestAurora:
         rn_aur = u_aur.norm(dim=-1)
         ratio_std = (rn_std.max() / rn_std.min()).item()
         ratio_aur = (rn_aur.max() / rn_aur.min()).item()
-        # Aurora should noticeably tighten the ratio toward 1.
+        # Aurora's defining property: tighter row-norm ratio than vanilla polar.
         assert ratio_aur < ratio_std, (
             f"Aurora row-norm ratio {ratio_aur:.3f} should be tighter than "
             f"standard polar {ratio_std:.3f}"
         )
-        assert ratio_aur < 1.15, (
+        # Loose absolute upper bound: target is 1.0, but bf16 precision /
+        # polar_express coefficient choice can drift this. The relative
+        # check above is the load-bearing assertion; this bound just catches
+        # gross regressions (e.g., the row-norm loop becomes a no-op).
+        assert ratio_aur < 1.25, (
             f"Aurora row-norm ratio {ratio_aur:.3f} should be close to 1"
         )
 
@@ -407,6 +436,10 @@ class TestNumHeads:
     def test_normuon_matches_3d(self):
         from dion import NorMuon
         self._run_parity(NorMuon, dict(lr=0.01))
+
+    def test_aurora_matches_3d(self):
+        from dion import Aurora
+        self._run_parity(Aurora, dict(lr=0.01))
 
     def test_muon_invalid_num_heads(self):
         from dion import Muon

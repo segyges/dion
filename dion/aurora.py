@@ -14,13 +14,7 @@ from .megabatch_base import (
     adjust_lr_aurora_aspect,
 )
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
-from .newton_schulz_triton import (
-    TRITON_AVAILABLE,
-    newton_schulz_triton,
-    zeropower_via_newtonschulz5,
-)
 from .opt_utils import AsyncTask, to_local
-from .polar_express import polar_express, polar_express_triton
 
 
 class Aurora(DistributedOrthoBase):
@@ -51,7 +45,9 @@ class Aurora(DistributedOrthoBase):
         adjust_lr: How to adjust the learning rate ("spectral_norm", "rms_norm",
             "aurora_aspect", or None).
             "spectral_norm" (default, same as Muon/NorMuon): scales by sqrt(m/n)
-            regardless of orientation.
+            regardless of orientation. NOTE: this is NOT the Aurora-paper
+            convention; wide-matrix updates will be smaller than the reference.
+            See ``adjust_lr="aurora_aspect"`` for paper-faithful scaling.
             "aurora_aspect": scales by ``max(1, m/n)^0.5``, matching the Aurora
             reference exactly (wide matrices unscaled). Use this for
             reference-faithful Aurora.
@@ -110,50 +106,6 @@ class Aurora(DistributedOrthoBase):
         if pp_beta < 0.0:
             raise ValueError(f"Invalid pp_beta: {pp_beta}")
 
-        # Resolve the base polar function (the one wrapped by Aurora's
-        # diagonal preconditioning). Mirrors DistributedOrthoBase resolution.
-        if newton_schulz_func is not None:
-            if not callable(newton_schulz_func):
-                raise TypeError(
-                    f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
-                )
-            base_polar = newton_schulz_func
-        elif use_gram_newton_schulz:
-            try:
-                from gram_newton_schulz import GramNewtonSchulz
-            except ImportError:
-                raise ImportError(
-                    "use_gram_newton_schulz=True requires the 'gram-newton-schulz' package, "
-                    "which is not installed. "
-                    "Install it with: pip install gram-newton-schulz"
-                )
-            _gns = GramNewtonSchulz(
-                ns_use_kernels=use_triton,
-                use_gram_newton_schulz=True,
-                gram_newton_schulz_reset_iterations=[2],
-                compile_kwargs=dict(fullgraph=True, mode="default"),
-            )
-            base_polar = lambda X, epsilon=None: _gns(X)
-        elif use_polar_express and use_triton:
-            base_polar = polar_express_triton
-        elif use_polar_express:
-            base_polar = polar_express
-        elif use_triton:
-            if not TRITON_AVAILABLE:
-                raise ImportError(
-                    "use_triton=True requires the 'triton' package, which is not installed. "
-                    "Install it with: pip install dion[triton]  (or: pip install triton)"
-                )
-            base_polar = newton_schulz_triton
-        else:
-            base_polar = zeropower_via_newtonschulz5
-
-        # Stash the unwrapped base polar so ``_create_ortho_tasks`` can rebuild
-        # the Aurora wrapper each step using the param group's current
-        # ``pp_iterations`` / ``pp_beta`` (which an LR scheduler or warmup
-        # might mutate, just like ``lr``/``mu``).
-        self._aurora_base_polar = base_polar
-
         defaults = dict(
             lr=lr,
             mu=mu,
@@ -170,13 +122,26 @@ class Aurora(DistributedOrthoBase):
             pp_iterations=pp_iterations,
             pp_beta=pp_beta,
         )
-        # Pass an init-time wrapper as the base ``newton_schulz_func`` so the
-        # parent class is happy; ``_create_ortho_tasks`` overrides it per-step.
+        # Let the parent class resolve the standard polar function from the
+        # usual option set; we then wrap it with Aurora's diagonal-
+        # preconditioning loop. ``_create_ortho_tasks`` rebuilds the wrapper
+        # each step so a scheduler can mutate ``pp_iterations`` / ``pp_beta``
+        # the same way it can mutate ``lr`` / ``mu``.
         super().__init__(
             params, distributed_mesh, "aurora", defaults,
-            newton_schulz_func=make_aurora_polar(
-                base_polar=base_polar, pp_iterations=pp_iterations, pp_beta=pp_beta,
-            ),
+            use_gram_newton_schulz=use_gram_newton_schulz,
+            use_triton=use_triton,
+            use_polar_express=use_polar_express,
+            newton_schulz_func=newton_schulz_func,
+        )
+        self._aurora_base_polar = self._newton_schulz_func
+        # Overwrite the parent's resolved func with the Aurora-wrapped version
+        # so nothing accidentally reads the unwrapped polar at step time.
+        self._newton_schulz_func = make_aurora_polar(
+            base_polar=self._aurora_base_polar,
+            pp_iterations=pp_iterations,
+            pp_beta=pp_beta,
+            eps=epsilon,
         )
 
     def _create_ortho_tasks(
@@ -223,6 +188,7 @@ class Aurora(DistributedOrthoBase):
                     base_polar=self._aurora_base_polar,
                     pp_iterations=pp_iterations,
                     pp_beta=pp_beta,
+                    eps=group["epsilon"],
                 ),
                 cautious_wd=group["cautious_wd"],
             )
@@ -344,6 +310,7 @@ def make_aurora_polar(
     base_polar: Callable,
     pp_iterations: int = 2,
     pp_beta: float = 0.5,
+    eps: Optional[float] = None,
 ) -> Callable:
     """
     Build an Aurora-flavored polar function that has the same signature as a
@@ -357,8 +324,20 @@ def make_aurora_polar(
     pathway (the same one Muon/NorMuon use), so the output here has
     spectral norm at most 1 and unit row-norm structure.
 
+    Args:
+        base_polar: standard polar / Newton-Schulz function.
+        pp_iterations: number of preconditioned-polar rounds.
+        pp_beta: row-norm diagonal-update exponent.
+        eps: Python float used for row-norm / row_sq clamps. If ``None``, the
+            wrapper falls back to coercing whatever ``epsilon`` is passed in at
+            call time. The optimizer's ``_create_ortho_tasks`` bakes this in
+            once per step so the closure does not need to ``float()`` a tensor
+            on every call.
+
     Reference: https://github.com/tilde-research/aurora-release/blob/main/aurora.py
     """
+    baked_eps = float(eps) if eps is not None else None
+
     def aurora_polar(X: Tensor, epsilon=1e-7) -> Tensor:
         m, n = X.size(-2), X.size(-1)
 
@@ -370,8 +349,14 @@ def make_aurora_polar(
             mm = max(m, n)
             nn = min(m, n)
             # Use a Python float for clamp(min=...) to avoid device-mismatch
-            # when ``epsilon`` is a CPU Tensor (the megabatch path).
-            eps_f = float(epsilon) if isinstance(epsilon, Tensor) else float(epsilon)
+            # when ``epsilon`` is a CPU Tensor (the megabatch path). Prefer the
+            # value baked in at wrapper-construction time.
+            if baked_eps is not None:
+                eps_f = baked_eps
+            elif isinstance(epsilon, Tensor):
+                eps_f = epsilon.item()
+            else:
+                eps_f = float(epsilon)
             X32 = X_t.to(torch.float32)
             target_row_sq = nn / mm
             row_norm = X32.norm(dim=-1, keepdim=True).clamp(min=eps_f)

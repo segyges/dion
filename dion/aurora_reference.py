@@ -170,8 +170,8 @@ class Aurora(Optimizer):
                 g = p.grad
                 if g is None:
                     continue
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
+                # ``__init__`` rejects non-2D aurora params, so no ndim-reshape
+                # branch is needed here (matches ``muon_reference.Muon``).
 
                 state = self.state[p]
                 if "momentum_buffer" not in state:

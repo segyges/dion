@@ -19,6 +19,63 @@ from .opt_utils import AsyncRuntime, AsyncTask, to_local
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 
+def resolve_newton_schulz_func(
+    newton_schulz_func: Optional[Callable],
+    use_gram_newton_schulz: bool,
+    use_triton: bool,
+    use_polar_express: bool,
+) -> Callable:
+    """
+    Resolve the Newton-Schulz / polar function from the standard option set
+    used by all distributed orthogonalization optimizers (Muon, NorMuon,
+    Dion2, Aurora). Returned function has signature
+    ``func(input: Tensor, epsilon: float) -> Tensor``.
+
+    Precedence (highest first):
+      1. an explicit ``newton_schulz_func`` callable
+      2. ``use_gram_newton_schulz=True`` (requires the gram-newton-schulz package)
+      3. ``use_polar_express`` (optionally fused with ``use_triton``)
+      4. ``use_triton=True`` (Triton Newton-Schulz)
+      5. fallback: ``zeropower_via_newtonschulz5`` (pure PyTorch)
+    """
+    if newton_schulz_func is not None:
+        if not callable(newton_schulz_func):
+            raise TypeError(
+                f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
+            )
+        return newton_schulz_func
+    if use_gram_newton_schulz:
+        try:
+            from gram_newton_schulz import GramNewtonSchulz
+        except ImportError:
+            raise ImportError(
+                "use_gram_newton_schulz=True requires the 'gram-newton-schulz' package, "
+                "which is not installed. "
+                "Install it with: pip install gram-newton-schulz"
+            )
+        _gns = GramNewtonSchulz(
+            ns_use_kernels=use_triton,
+            use_gram_newton_schulz=True,
+            gram_newton_schulz_reset_iterations=[2],
+            # Some compiler crashes were observed with mode="reduce-overhead"
+            # when we also compile the entire optimizer step.
+            compile_kwargs=dict(fullgraph=True, mode="default"),
+        )
+        return lambda X, epsilon=None: _gns(X)
+    if use_polar_express and use_triton:
+        return polar_express_triton
+    if use_polar_express:
+        return polar_express
+    if use_triton:
+        if not TRITON_AVAILABLE:
+            raise ImportError(
+                "use_triton=True requires the 'triton' package, which is not installed. "
+                "Install it with: pip install dion[triton]  (or: pip install triton)"
+            )
+        return newton_schulz_triton
+    return zeropower_via_newtonschulz5
+
+
 class DistributedOrthoBase(Optimizer):
     """
     Shared base class for distributed orthogonalization optimizers (NorMuon, Dion2).
@@ -68,43 +125,12 @@ class DistributedOrthoBase(Optimizer):
         self._distributed_mesh = distributed_mesh
 
         # Orthogonalization function configuration
-        if newton_schulz_func is not None:
-            if not callable(newton_schulz_func):
-                raise TypeError(
-                    f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
-                )
-            self._newton_schulz_func = newton_schulz_func
-        elif use_gram_newton_schulz:
-            try:
-                from gram_newton_schulz import GramNewtonSchulz
-            except ImportError:
-                raise ImportError(
-                    "use_gram_newton_schulz=True requires the 'gram-newton-schulz' package, "
-                    "which is not installed. "
-                    "Install it with: pip install gram-newton-schulz"
-                )
-            use_polar_express = True
-            _gns = GramNewtonSchulz(
-                ns_use_kernels=use_triton,
-                use_gram_newton_schulz=True,
-                gram_newton_schulz_reset_iterations=[2],
-                # Some compiler crashes were observed with mode="reduce-overhead" when we also compile the entire optimizer step.
-                compile_kwargs=dict(fullgraph=True, mode="default"),
-            )
-            self._newton_schulz_func = lambda X, epsilon=None: _gns(X)
-        elif use_polar_express and use_triton:
-            self._newton_schulz_func = polar_express_triton
-        elif use_polar_express:
-            self._newton_schulz_func = polar_express
-        elif use_triton:
-            if not TRITON_AVAILABLE:
-                raise ImportError(
-                    "use_triton=True requires the 'triton' package, which is not installed. "
-                    "Install it with: pip install dion[triton]  (or: pip install triton)"
-                )
-            self._newton_schulz_func = newton_schulz_triton
-        else:
-            self._newton_schulz_func = zeropower_via_newtonschulz5
+        self._newton_schulz_func = resolve_newton_schulz_func(
+            newton_schulz_func=newton_schulz_func,
+            use_gram_newton_schulz=use_gram_newton_schulz,
+            use_triton=use_triton,
+            use_polar_express=use_polar_express,
+        )
 
     @torch.no_grad()
     def step(self, closure=None):

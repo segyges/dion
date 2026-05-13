@@ -258,6 +258,136 @@ def adamw_update_foreach_async(
     yield
 
 
+def adamw_update_foreach_syre(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    V: List[Tensor],  # Variance buffer (modified in place)
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+    cautious_wd: bool,
+    syre_seeds1: List[int],
+    syre_seeds2: List[int],
+    syre_std: float,
+    syre_offset_bases: List[int],
+    advanced_removal: bool,
+    d_bound: float,
+):
+    """AdamW step with SYRE weight decay applied per param.
+
+    Eager (not ``torch._fused_adamw_``-backed) so we can expose the
+    per-param update direction ``update_dir = M_new / denom`` to the
+    cautious-SYRE Triton kernel, which gates the SYRE diff by
+    ``(update_dir * X >= 0)``. The non-SYRE AdamW path stays on the
+    faster fused kernel in :func:`adamw_update_foreach`.
+
+    Replaces the AdamW decoupled weight-decay step with the SYRE pull
+    ``X <- X - lr*wd*(X - theta_0)`` (optionally cautious-masked,
+    optionally with SYRE-AR). Order of ops per call:
+
+      1. ``M``/``V`` update in place (standard AdamW).
+      2. ``denom = sqrt(V/bc2) + eps``; ``update_dir = M / denom``.
+      3. SYRE WD step on ``X`` -- replaces the standard
+         ``X.mul_(1 - lr*wd)``. The kernel reads the pre-update ``X``
+         for the cautious mask.
+      4. ``X.sub_(update_dir, alpha=lr/bc1)`` -- standard AdamW
+         gradient step.
+
+    The cautious-SYRE branch matches segyges/aurora's AdamW+SYRE form:
+    mask source is the bias-corrected update direction, not the SYRE
+    diff itself (CWD applied to SYRE).
+    """
+    from .syre import syre_wd_inplace
+
+    if not X:
+        return
+    n = len(X)
+    assert n == len(G) == len(M) == len(V)
+    assert n == len(syre_seeds1) == len(syre_seeds2) == len(syre_offset_bases)
+
+    lr_f = float(lr)
+    beta1_f = float(beta1)
+    beta2_f = float(beta2)
+    wd_f = float(weight_decay)
+    eps_f = float(epsilon)
+    step_i = int(step)
+
+    bc1 = 1.0 - beta1_f**step_i
+    bc2 = 1.0 - beta2_f**step_i
+    bc2_sqrt = bc2**0.5
+    adj_lr_f = lr_f / bc1
+    gamma = lr_f * wd_f
+
+    # M = beta1 * M + (1 - beta1) * G. Cast G to M's dtype to match
+    # ``adamw_update`` (which does ``G.to(M.dtype)`` element-wise).
+    G_cast = [g.to(m.dtype) for g, m in zip(G, M)]
+    torch._foreach_lerp_(M, G_cast, 1.0 - beta1_f)
+
+    # V = beta2 * V + (1 - beta2) * G * G.
+    torch._foreach_mul_(V, beta2_f)
+    torch._foreach_addcmul_(V, G_cast, G_cast, value=1.0 - beta2_f)
+
+    # denom = sqrt(V) / sqrt(bc2) + eps.
+    denom = torch._foreach_sqrt(V)
+    torch._foreach_div_(denom, bc2_sqrt)
+    torch._foreach_add_(denom, eps_f)
+
+    # update_dir = M / denom. Allocated; reused for the cautious-SYRE
+    # mask and the final param add.
+    update_dirs = torch._foreach_div(M, denom)
+
+    # SYRE WD step. ``gamma == 0`` is a no-op inside the kernel, but
+    # we also skip the launch loop entirely to keep host overhead low
+    # for the common ``weight_decay=0`` case.
+    if gamma > 0.0:
+        for i, x in enumerate(X):
+            syre_wd_inplace(
+                x,
+                gamma=gamma,
+                seed1=syre_seeds1[i],
+                std=syre_std,
+                seed2=syre_seeds2[i],
+                d_bound=d_bound,
+                advanced_removal=advanced_removal,
+                offset_base=syre_offset_bases[i],
+                U=update_dirs[i] if cautious_wd else None,
+            )
+
+    # X = X - adj_lr * update_dir.
+    torch._foreach_add_(X, update_dirs, alpha=-adj_lr_f)
+
+
+def adamw_update_foreach_syre_async(
+    X: List[Tensor],
+    G: List[Tensor],
+    M: List[Tensor],
+    V: List[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+    cautious_wd: bool,
+    syre_seeds1: List[int],
+    syre_seeds2: List[int],
+    syre_std: float,
+    syre_offset_bases: List[int],
+    advanced_removal: bool,
+    d_bound: float,
+) -> Generator[None, None, None]:
+    adamw_update_foreach_syre(
+        X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon,
+        cautious_wd, syre_seeds1, syre_seeds2, syre_std, syre_offset_bases,
+        advanced_removal, d_bound,
+    )
+    yield
+
+
 def lion_update_foreach_async(
     X: List[Tensor],
     G: List[Tensor],

@@ -1,3 +1,5 @@
+import math
+
 import torch
 from collections import defaultdict
 from torch import Tensor
@@ -15,6 +17,52 @@ from .megabatch_base import (
 )
 from .muon import muon_update_pre_orthogonalize, muon_update_post_orthogonalize
 from .opt_utils import AsyncTask, to_local
+
+
+def _validate_syre_kwargs(
+    syre_wd, syre_std, advanced_removal, d_bound,
+):
+    """Strict validation for SYRE-related per-group kwargs.
+
+    Called from ``Aurora.__init__`` and ``Aurora.add_param_group`` so
+    typos and bad types are caught at construction / mutation time
+    rather than at the first SYRE step.
+    """
+    if not isinstance(syre_wd, bool):
+        raise TypeError(
+            f"syre_wd must be a bool, got {type(syre_wd).__name__}: {syre_wd!r}"
+        )
+    if not isinstance(advanced_removal, bool):
+        raise TypeError(
+            f"advanced_removal must be a bool, got "
+            f"{type(advanced_removal).__name__}: {advanced_removal!r}"
+        )
+    if not isinstance(d_bound, (int, float)) or isinstance(d_bound, bool):
+        raise TypeError(
+            f"d_bound must be a float in [0, 1), got "
+            f"{type(d_bound).__name__}: {d_bound!r}"
+        )
+    if not (0.0 <= float(d_bound) < 1.0):
+        raise ValueError(
+            f"d_bound must be in [0, 1), got {d_bound}"
+        )
+    if syre_wd:
+        if syre_std is None:
+            raise ValueError(
+                "syre_wd=True requires an explicit syre_std (positive float). "
+                "There is intentionally no empirical default; if you want to "
+                "scale by the param's init magnitude, compute it explicitly "
+                "and pass syre_std=<your_value>."
+            )
+        if isinstance(syre_std, bool) or not isinstance(syre_std, (int, float)):
+            raise TypeError(
+                f"syre_std must be a positive float, got "
+                f"{type(syre_std).__name__}: {syre_std!r}"
+            )
+        if float(syre_std) <= 0.0:
+            raise ValueError(
+                f"syre_std must be a positive float, got {syre_std}"
+            )
 
 
 class Aurora(DistributedOrthoBase):
@@ -59,6 +107,19 @@ class Aurora(DistributedOrthoBase):
             Aurora paper default; ``pp_iterations=1`` is single-shot row-norm
             preconditioning.
         pp_beta: Exponent for the diagonal update between iterations.
+        syre_wd: Whether to apply SYRE weight decay
+            (``theta <- theta - lr*wd*(theta - theta_0)``) in place of the
+            standard decoupled WD step. ``theta_0`` is regenerated from a
+            stored per-parameter PRNG seed each step. Requires CUDA + triton.
+        syre_std: Required when ``syre_wd=True``. Scale of ``theta_0``. No
+            empirical default -- if you want to couple this to your init
+            magnitude, compute and pass it explicitly.
+        advanced_removal: SYRE-AR variant. Multiplies the SYRE diff by a per-
+            element ``Uniform(1 - d_bound, 1 + d_bound)`` factor before the
+            decay step, breaking continuous symmetries the basic form leaves
+            untouched. No-op when ``syre_wd=False``.
+        d_bound: Half-width of the SYRE-AR uniform interval. Ignored unless
+            ``advanced_removal=True``. Must lie in ``[0, 1)``.
         use_triton: Whether to use the Triton Newton-Schulz kernel.
         use_polar_express: Whether to use Polar Express for the base polar.
         newton_schulz_func: Optional custom base polar function. Aurora wraps
@@ -83,6 +144,10 @@ class Aurora(DistributedOrthoBase):
         flatten: bool = False,
         pp_iterations: int = 2,
         pp_beta: float = 0.5,
+        syre_wd: bool = False,
+        syre_std: Optional[float] = None,
+        advanced_removal: bool = False,
+        d_bound: float = 0.01,
         use_gram_newton_schulz: bool = False,
         use_triton: bool = False,
         use_polar_express: bool = True,
@@ -105,6 +170,19 @@ class Aurora(DistributedOrthoBase):
             )
         if pp_beta < 0.0:
             raise ValueError(f"Invalid pp_beta: {pp_beta}")
+        _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+
+        # Gate the triton import at construction time when SYRE is on, so
+        # users without triton don't have to wait until the first step
+        # to find out it isn't available.
+        if syre_wd:
+            try:
+                from . import syre as _syre_module  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "syre_wd=True requires triton. Install dion's optional "
+                    "triton extra (or install triton directly) and retry."
+                ) from e
 
         defaults = dict(
             lr=lr,
@@ -121,6 +199,10 @@ class Aurora(DistributedOrthoBase):
             adjust_lr=adjust_lr,
             pp_iterations=pp_iterations,
             pp_beta=pp_beta,
+            syre_wd=syre_wd,
+            syre_std=syre_std,
+            advanced_removal=advanced_removal,
+            d_bound=d_bound,
         )
         # Let the parent class resolve the standard polar function from the
         # usual option set; we then wrap it with Aurora's diagonal-
@@ -143,6 +225,68 @@ class Aurora(DistributedOrthoBase):
             pp_beta=pp_beta,
             eps=epsilon,
         )
+
+    def add_param_group(self, param_group: dict) -> None:
+        """Validate SYRE-related kwargs on each new group, mirroring the
+        construction-time checks. Defaults are filled in by torch's base
+        ``add_param_group`` from ``self.defaults`` if not present.
+        """
+        syre_wd = param_group.get("syre_wd", self.defaults["syre_wd"])
+        syre_std = param_group.get("syre_std", self.defaults["syre_std"])
+        advanced_removal = param_group.get(
+            "advanced_removal", self.defaults["advanced_removal"]
+        )
+        d_bound = param_group.get("d_bound", self.defaults["d_bound"])
+        _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+        super().add_param_group(param_group)
+
+    def _get_or_init_syre_seeds(
+        self, p: Tensor, advanced_removal: bool,
+    ) -> Tuple[int, int]:
+        """Lazily draw SYRE seeds for ``p`` and store them in ``self.state[p]``.
+
+        Seeds are drawn from ``torch.randint``, so a global
+        ``torch.manual_seed`` makes a run reproducible. ``seed2`` is only
+        drawn (non-zero) when ``advanced_removal=True``; otherwise it stays
+        0 and the kernel ignores it.
+
+        State is keyed by the original parameter object, so the seeds
+        round-trip through ``state_dict`` automatically.
+        """
+        s = self.state[p]
+        if "syre_seed1" not in s:
+            s["syre_seed1"] = int(torch.randint(0, 2**31, (1,)).item())
+        if "syre_seed2" not in s:
+            s["syre_seed2"] = (
+                int(torch.randint(0, 2**31, (1,)).item())
+                if advanced_removal else 0
+            )
+        return s["syre_seed1"], s["syre_seed2"]
+
+    def _compute_syre_offset_base(self, p: Tensor) -> int:
+        """Compute the per-rank Philox offset base for SYRE on ``p``.
+
+        Sharded params: ``device_rank * padded_local_size`` where
+        ``padded_local_size = ceil(global_numel / world_size)``. This is a
+        sharding-plan-agnostic upper bound -- different ranks get disjoint
+        offset ranges of at least ``local_numel`` each, with gaps that are
+        never read. Uniqueness across ranks is what matters for SYRE
+        correctness; tight packing isn't.
+
+        Replicated params (regular Tensor, DDP, or single-GPU):
+        ``offset_base = 0`` for every rank. All ranks pull toward the same
+        ``theta_0`` so replicas stay synchronized after the step.
+
+        Not stored -- recomputed each step so the value tracks the current
+        sharding plan on resume (in case the user changes ``world_size``).
+        """
+        if isinstance(p, DTensor):
+            global_numel = math.prod(p.shape)
+            padded_local_size = (
+                (global_numel + self._world_size - 1) // self._world_size
+            )
+            return self._device_rank * padded_local_size
+        return 0
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
@@ -173,6 +317,11 @@ class Aurora(DistributedOrthoBase):
             if pp_beta < 0.0:
                 raise ValueError(f"Invalid pp_beta: {pp_beta}")
 
+            syre_wd = group["syre_wd"]
+            advanced_removal = group["advanced_removal"]
+            d_bound = float(group["d_bound"])
+            syre_std = float(group["syre_std"]) if syre_wd else 0.0
+
             update_args = dict(
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
@@ -191,6 +340,10 @@ class Aurora(DistributedOrthoBase):
                     eps=group["epsilon"],
                 ),
                 cautious_wd=group["cautious_wd"],
+                syre_wd=syre_wd,
+                syre_std=syre_std,
+                advanced_removal=advanced_removal,
+                d_bound=d_bound,
             )
 
             shape_groups: dict[tuple, list] = defaultdict(list)
@@ -200,12 +353,23 @@ class Aurora(DistributedOrthoBase):
 
             num_heads = self._resolve_num_heads(group)
 
-            for (_shape, _sharding, _dtype), params in shape_groups.items():
-                gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, "aurora") for p in params]
+            for (_shape, _sharding, _dtype), original_params in shape_groups.items():
+                gradients = [p.grad for p in original_params]
+                states = [
+                    self._get_or_initialize_state(p, "aurora")
+                    for p in original_params
+                ]
                 momentums = [s["momentum"] for s in states]
+                params = original_params
 
                 if num_heads is not None:
+                    if syre_wd:
+                        raise NotImplementedError(
+                            "syre_wd=True with num_heads is not supported on "
+                            "this branch. The post-orth per-param SYRE state "
+                            "would need to follow the head-split mapping; "
+                            "left as a v1 limitation."
+                        )
                     params, gradients, momentums = self._prepare_head_split(
                         num_heads, params, gradients, momentums
                     )
@@ -220,12 +384,36 @@ class Aurora(DistributedOrthoBase):
                         megabatch_args = {**update_args, "process_group": None}
                     shard_dim = sharded_tensor_dim
 
+                # Per-param SYRE state. Drawn lazily on first use; keyed by
+                # the original (pre-head-split) param object so it round-
+                # trips through ``state_dict``.
+                if syre_wd:
+                    syre_seeds1: List[int] = []
+                    syre_seeds2: List[int] = []
+                    syre_offset_bases: List[int] = []
+                    for p in original_params:
+                        s1, s2 = self._get_or_init_syre_seeds(
+                            p, advanced_removal
+                        )
+                        syre_seeds1.append(s1)
+                        syre_seeds2.append(s2)
+                        syre_offset_bases.append(
+                            self._compute_syre_offset_base(p)
+                        )
+                else:
+                    syre_seeds1 = None
+                    syre_seeds2 = None
+                    syre_offset_bases = None
+
                 yield AsyncTask(
                     aurora_update_megabatch_async(
                         X=params,
                         G=gradients,
                         M=momentums,
                         shard_dim=shard_dim,
+                        syre_seeds1=syre_seeds1,
+                        syre_seeds2=syre_seeds2,
+                        syre_offset_bases=syre_offset_bases,
                         **megabatch_args,
                     )
                 )
@@ -248,11 +436,24 @@ def aurora_update_megabatch_async(
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
+    syre_wd: bool = False,
+    syre_std: float = 0.0,
+    advanced_removal: bool = False,
+    d_bound: float = 0.01,
+    syre_seeds1: Optional[List[int]] = None,
+    syre_seeds2: Optional[List[int]] = None,
+    syre_offset_bases: Optional[List[int]] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Aurora update. Reuses Muon's pre/post-orthogonalize stages
     and the shared megabatch communication; ``newton_schulz_func`` is the
     Aurora-wrapped polar (see ``make_aurora_polar``).
+
+    When ``syre_wd=False`` the post-orth path is the standard (compiled)
+    ``muon_update_post_orthogonalize``. When ``syre_wd=True`` it routes
+    through :func:`aurora_update_post_orthogonalize`, which is *not*
+    ``torch.compile``'d because the SYRE step launches a Triton kernel
+    per parameter.
     """
     N = len(X)
     assert N == len(G) == len(M)
@@ -296,14 +497,84 @@ def aurora_update_megabatch_async(
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
-    muon_update_post_orthogonalize(
-        X=to_local(X),
-        U=U,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-        cautious_wd=cautious_wd,
-    )
+    X_local = to_local(X)
+
+    if syre_wd:
+        aurora_update_post_orthogonalize(
+            X=X_local,
+            U=U,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            cautious_wd=cautious_wd,
+            syre_seeds1=syre_seeds1,
+            syre_seeds2=syre_seeds2,
+            syre_std=syre_std,
+            syre_offset_bases=syre_offset_bases,
+            advanced_removal=advanced_removal,
+            d_bound=d_bound,
+        )
+    else:
+        muon_update_post_orthogonalize(
+            X=X_local,
+            U=U,
+            base_lr=lr,
+            adjusted_lr=adjusted_lr,
+            weight_decay=weight_decay,
+            cautious_wd=cautious_wd,
+        )
+
+
+def aurora_update_post_orthogonalize(
+    X: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
+    cautious_wd: bool,
+    syre_seeds1: List[int],
+    syre_seeds2: List[int],
+    syre_std: float,
+    syre_offset_bases: List[int],
+    advanced_removal: bool,
+    d_bound: float,
+) -> None:
+    """SYRE-aware post-orthogonalize step. Per-param, in order:
+
+      1. SYRE WD step on ``X[i]`` -- cautious-masked by ``U[i]`` when
+         ``cautious_wd=True``. Decay coefficient ``gamma = base_lr *
+         weight_decay``.
+      2. ``X[i].sub_(U[i], alpha=adjusted_lr)`` -- the standard
+         post-orth param add, identical to
+         :func:`dion.muon.muon_update_post_orthogonalize`'s final step.
+
+    Intentionally not ``@torch.compile``'d: the SYRE step calls a Triton
+    kernel per param, which fullgraph compile cannot trace. The non-SYRE
+    path stays on the compiled ``muon_update_post_orthogonalize``.
+
+    If SYRE later gains other clients (Muon, NorMuon, ...), the cleaner
+    home for this helper is :mod:`dion.muon` alongside the standard
+    post-orth, with the foreach fast path and the SYRE branch coexisting
+    in one function.
+    """
+    from .syre import syre_wd_inplace
+
+    gamma = float(base_lr) * float(weight_decay)
+    adj_lr_f = float(adjusted_lr)
+
+    for i, (x, u) in enumerate(zip(X, U)):
+        syre_wd_inplace(
+            x,
+            gamma=gamma,
+            seed1=syre_seeds1[i],
+            std=syre_std,
+            seed2=syre_seeds2[i],
+            d_bound=d_bound,
+            advanced_removal=advanced_removal,
+            offset_base=syre_offset_bases[i],
+            U=u if cautious_wd else None,
+        )
+        x.sub_(u, alpha=adj_lr_f)
 
 
 def make_aurora_polar(

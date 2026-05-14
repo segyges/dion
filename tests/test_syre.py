@@ -1306,12 +1306,32 @@ def test_resolve_syre_std_conv_shape_fan_in_includes_kernel():
     assert math.isclose(lecun, 0.01 / math.sqrt(expected_fan_in))
 
 
-def test_resolve_syre_std_preset_rejects_ndim_lt_2():
+def test_resolve_syre_std_preset_ndim_lt_2_uses_numel():
+    """For ndim<2 (bias / LayerNorm / scalar params), presets degrade
+    to ``fan_in = numel, fan_out = 1`` -- the direct extension of the
+    matrix formula. Lets users include those params in a SYRE-decayed
+    AdamW group without writing a custom callable.
+    """
+    import math
     from dion.syre import resolve_syre_std
 
-    p = torch.nn.Parameter(torch.zeros(16))  # 1D
-    with pytest.raises(ValueError, match="ndim >= 2"):
-        resolve_syre_std(p, "lecun_fan_in")
+    p = torch.nn.Parameter(torch.zeros(16))  # 1D, numel=16
+    lecun = resolve_syre_std(p, "lecun_fan_in")
+    assert math.isclose(lecun, 0.01 / math.sqrt(16))
+    kaiming = resolve_syre_std(p, "kaiming_fan_in")
+    assert math.isclose(kaiming, 0.01 * math.sqrt(2.0 / 16))
+    xavier = resolve_syre_std(p, "xavier_normal")
+    assert math.isclose(xavier, 0.01 * math.sqrt(2.0 / (16 + 1)))
+
+
+def test_resolve_syre_std_preset_scalar_param():
+    """0D / numel=1 params use ``fan_in = 1, fan_out = 1``."""
+    import math
+    from dion.syre import resolve_syre_std
+
+    p = torch.nn.Parameter(torch.zeros(()))  # 0D scalar
+    lecun = resolve_syre_std(p, "lecun_fan_in")
+    assert math.isclose(lecun, 0.01 / math.sqrt(1))
 
 
 def test_resolve_syre_std_callable_accepts_any_ndim():
@@ -1536,22 +1556,24 @@ def test_syre_std_mode_e2e_pulls_toward_per_param_theta0():
     torch.testing.assert_close(p2.detach(), expected2, atol=1e-5, rtol=1e-5)
 
 
-def test_syre_std_mode_preset_rejects_ndim_lt_2_at_step():
-    """A preset on an AdamW group containing a 1D param raises when the
-    param's sigma_0 is resolved (lazy, on first step). This is the
-    expected failure mode for users who want SYRE on bias/LN params --
-    they should pass a callable instead.
+@gpu_only
+def test_syre_std_mode_preset_works_on_1d_adamw_param():
+    """A preset on an AdamW group with a 1D param (bias / LN) must
+    succeed -- the ndim<2 numel fallback gives a small but valid
+    per-element sigma_0. The cached value matches the preset formula
+    using ``fan_in = numel, fan_out = 1``.
     """
-    if not HAS_TRITON_GPU:
-        pytest.skip("SYRE requires CUDA + triton")
-    p = torch.nn.Parameter(torch.randn(16, device="cuda") * 0.1)
+    import math
+
+    n = 16
+    p = torch.nn.Parameter(torch.randn(n, device="cuda") * 0.1)
     opt = Aurora([
         {"params": [p], "algorithm": "adamw"},
     ], lr=0.05, weight_decay=0.05,
        syre_wd=True, syre_std_mode="lecun_fan_in")
     p.grad = torch.randn_like(p)
-    with pytest.raises(ValueError, match="ndim >= 2"):
-        opt.step()
+    opt.step()  # must not raise
+    assert math.isclose(opt.state[p]["syre_std"], 0.01 / math.sqrt(n))
 
 
 def test_syre_std_mode_theorem3_warning_uses_min_per_param_sigma0():

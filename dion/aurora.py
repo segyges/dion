@@ -362,9 +362,14 @@ class Aurora(DistributedOrthoBase):
             Resolved per-tensor at param-registration time and cached in
             the optimizer state. Presets follow Ziyin et al. (2024)
             §5.4: ``sigma_0 = 0.01 * (init_std_for_p)``, with each
-            preset using a different init scheme's std. Presets require
-            ``ndim >= 2``; for ``ndim < 2`` (e.g. AdamW bias/LN groups)
-            pass a callable. Mutually exclusive with ``syre_std``.
+            preset using a different init scheme's std. For
+            ``ndim < 2`` (1D bias / LayerNorm / scalar params) presets
+            degrade to ``fan_in = numel, fan_out = 1`` -- a direct
+            extension of the matrix formula; this gives a small per-
+            element sigma_0 that won't conflict with typical 1D init
+            scales. Custom inits (PyTorch Linear bias, LLaMA's 0.02,
+            LN gamma=1.0) are out of scope -- use a callable for those.
+            Mutually exclusive with ``syre_std``.
         advanced_removal: SYRE-AR variant. Multiplies the SYRE diff by a per-
             element ``Uniform(1 - d_bound, 1 + d_bound)`` factor before the
             decay step, breaking continuous symmetries the basic form leaves

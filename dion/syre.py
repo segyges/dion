@@ -117,20 +117,30 @@ from torch import Tensor
 #   kaiming_fan_in: init std = sqrt(2/fan_in)            (He-normal, ReLU/GELU)
 #   xavier_normal:  init std = sqrt(2/(fan_in+fan_out))  (Glorot normal)
 #
-# Fan-in / fan-out follow PyTorch's nn.init conventions for ndim >= 2:
+# Fan-in / fan-out for ndim >= 2 follow PyTorch's nn.init conventions:
 #   fan_in  = prod(shape[1:])   (= shape[-1] for 2D, = in*k*k for conv)
 #   fan_out = shape[0]
-# ndim < 2 is rejected -- fan-in is undefined for scalars/vectors. Users who
-# want SYRE on bias / LayerNorm parameters should pass a callable instead
-# (e.g. ``lambda p: 0.01 * <known_init_std_for_p>``).
+#
+# For ndim < 2 (1D bias / LayerNorm / scalar params) the presets degrade
+# to ``fan_in = numel, fan_out = 1`` -- a direct extension of the matrix
+# formula. This produces a small per-element sigma_0 ~ 0.01/sqrt(numel)
+# that pulls those params toward a frozen tiny-magnitude Gaussian field
+# rather than custom-fitting to the actual init (e.g. PyTorch's default
+# Linear bias uses ``1/sqrt(fan_in_of_linear)`` which the bias tensor
+# cannot recover from its own shape). The pull direction is real SYRE
+# (toward theta_0, not toward 0), just at a magnitude small relative
+# to typical 1D init scales. Custom init schemes (LLaMA's 0.02 const,
+# PyTorch Linear bias, LN gamma=1.0, ...) are out of scope for the
+# presets -- pass a callable for those:
+#
+#   syre_std_mode=lambda p: 0.01 * <your_known_init_std_for_p>
 def _fan_in_fan_out(p: Tensor) -> tuple:
     if p.ndim < 2:
-        raise ValueError(
-            f"SYRE preset requires ndim >= 2 (got shape {tuple(p.shape)}). "
-            "Fan-in is undefined for scalars/vectors. Pass a callable to "
-            "syre_std_mode for full control, e.g. "
-            "syre_std_mode=lambda p: 0.01 * <your_init_std_for_p>."
-        )
+        # Treat 1D / 0D as a single-row matrix so the standard formulas
+        # produce a small but sensible per-element sigma_0. See module
+        # comment above for the rationale; custom inits use the callable
+        # form rather than tweaking the preset.
+        return int(p.numel()) if p.numel() > 0 else 1, 1
     fan_in = 1
     for d in p.shape[1:]:
         fan_in *= int(d)

@@ -258,6 +258,51 @@ def adamw_update_foreach_async(
     yield
 
 
+@torch.compile(fullgraph=True)
+def _adamw_syre_premath(
+    M: List[Tensor],
+    V: List[Tensor],
+    G: List[Tensor],
+    beta1: float,
+    beta2: float,
+    bc2_sqrt: Tensor,
+    epsilon: float,
+) -> List[Tensor]:
+    """Pre-SYRE AdamW pointwise math, compile-fused.
+
+    Mutates ``M`` and ``V`` in place; returns the bias-corrected update
+    direction ``update_dirs = M / (sqrt(V)/sqrt(bc2) + eps)``. Caller is
+    responsible for casting ``G`` to ``M``'s dtype (see the
+    short-circuit in :func:`adamw_update_foreach_syre`) so this helper
+    sees a single-dtype list.
+
+    The seven pointwise launches (lerp_, mul_, addcmul_, sqrt, div_,
+    add_, div) collapse to one fused multi-tensor kernel under compile.
+
+    ``bc2_sqrt`` is a 0-D Tensor, not a Python float: under
+    ``fullgraph=True`` Dynamo still re-specializes on changing scalar
+    values (the value enters guards even with
+    ``specialize_float=False``), so passing the per-step-varying bias
+    correction as a float triggers recompilation each call and trips
+    the recompile limit within ~10 steps. Wrapping as a 0-D tensor
+    routes the value through the data-dependent path, where Dynamo
+    sees a stable tensor type and the value enters via runtime memory
+    read. ``beta1`` / ``beta2`` / ``epsilon`` stay as floats: they're
+    fixed per param-group and won't change call-to-call.
+
+    List length specializes per call; Aurora groups params by shape+
+    dtype on the ortho path. On the AdamW path the list length is the
+    full group size, also stable across steps.
+    """
+    torch._foreach_lerp_(M, G, 1.0 - beta1)
+    torch._foreach_mul_(V, beta2)
+    torch._foreach_addcmul_(V, G, G, value=1.0 - beta2)
+    denom = torch._foreach_sqrt(V)
+    torch._foreach_div_(denom, bc2_sqrt)
+    torch._foreach_add_(denom, epsilon)
+    return torch._foreach_div(M, denom)
+
+
 def adamw_update_foreach_syre(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
@@ -279,22 +324,28 @@ def adamw_update_foreach_syre(
 ):
     """AdamW step with SYRE weight decay applied per param.
 
-    Eager (not ``torch._fused_adamw_``-backed) so we can expose the
-    per-param update direction ``update_dir = M_new / denom`` to the
+    Not ``torch._fused_adamw_``-backed because we need the per-param
+    update direction ``update_dir = M_new / denom`` exposed to the
     cautious-SYRE Triton kernel, which gates the SYRE diff by
     ``(update_dir * X >= 0)``. The non-SYRE AdamW path stays on the
     faster fused kernel in :func:`adamw_update_foreach`.
+
+    The AdamW pointwise math around the Triton kernel call IS compiled,
+    via :func:`_adamw_syre_premath` -- seven multi-tensor launches
+    collapse to one fused kernel. Only the SYRE Triton launch and the
+    final param add stay outside the compile boundary.
 
     Replaces the AdamW decoupled weight-decay step with the SYRE pull
     ``X <- X - lr*wd*(X - theta_0)`` (optionally cautious-masked,
     optionally with SYRE-AR). Order of ops per call:
 
-      1. ``M``/``V`` update in place (standard AdamW).
-      2. ``denom = sqrt(V/bc2) + eps``; ``update_dir = M / denom``.
-      3. SYRE WD step on ``X`` -- replaces the standard
+      1. ``M``/``V`` update in place (standard AdamW); compute
+         ``denom = sqrt(V/bc2) + eps`` and ``update_dir = M / denom``.
+         (All fused into :func:`_adamw_syre_premath`.)
+      2. SYRE WD step on ``X`` -- replaces the standard
          ``X.mul_(1 - lr*wd)``. The kernel reads the pre-update ``X``
          for the cautious mask.
-      4. ``X.sub_(update_dir, alpha=lr/bc1)`` -- standard AdamW
+      3. ``X.sub_(update_dir, alpha=lr/bc1)`` -- standard AdamW
          gradient step.
 
     The cautious-SYRE branch matches segyges/aurora's AdamW+SYRE form:
@@ -318,29 +369,32 @@ def adamw_update_foreach_syre(
 
     bc1 = 1.0 - beta1_f**step_i
     bc2 = 1.0 - beta2_f**step_i
-    bc2_sqrt = bc2**0.5
     adj_lr_f = lr_f / bc1
     gamma = lr_f * wd_f
+    # 0-D tensor (not Python float) -- see ``_adamw_syre_premath`` for
+    # why: a per-step-varying float arg trips Dynamo recompilation
+    # under ``fullgraph=True`` regardless of ``specialize_float``.
+    bc2_sqrt = torch.tensor(bc2**0.5, device=M[0].device, dtype=torch.float32)
 
-    # M = beta1 * M + (1 - beta1) * G. Cast G to M's dtype to match
-    # ``adamw_update`` (which does ``G.to(M.dtype)`` element-wise).
-    G_cast = [g.to(m.dtype) for g, m in zip(G, M)]
-    torch._foreach_lerp_(M, G_cast, 1.0 - beta1_f)
+    # Cast G to M's dtype, but short-circuit when dtypes already match
+    # (the common pure-bf16 and pure-fp32 cases) -- ``.to(same_dtype)``
+    # is a no-op copy but still costs an aten dispatch per param. Under
+    # standard autograd ``G[i].dtype == M[i].dtype`` per index (M
+    # initializes from p, G is p.grad, both follow p's dtype), so
+    # checking the head pair is a safe heuristic for the AdamW path
+    # where the param group isn't explicitly bucketed by dtype.
+    if G[0].dtype == M[0].dtype:
+        G_cast = G
+    else:
+        G_cast = [g.to(m.dtype) for g, m in zip(G, M)]
 
-    # V = beta2 * V + (1 - beta2) * G * G.
-    torch._foreach_mul_(V, beta2_f)
-    torch._foreach_addcmul_(V, G_cast, G_cast, value=1.0 - beta2_f)
+    # Compile-fused AdamW pointwise math: M/V update + denom + update_dirs.
+    # See :func:`_adamw_syre_premath`.
+    update_dirs = _adamw_syre_premath(
+        M, V, G_cast, beta1_f, beta2_f, bc2_sqrt, eps_f,
+    )
 
-    # denom = sqrt(V) / sqrt(bc2) + eps.
-    denom = torch._foreach_sqrt(V)
-    torch._foreach_div_(denom, bc2_sqrt)
-    torch._foreach_add_(denom, eps_f)
-
-    # update_dir = M / denom. Allocated; reused for the cautious-SYRE
-    # mask and the final param add.
-    update_dirs = torch._foreach_div(M, denom)
-
-    # SYRE WD step. Single fused launch over the list -- see
+    # SYRE WD step. Single fused Triton launch over the list -- see
     # ``syre_wd_multi_inplace`` and ``scripts/benchmark_syre.py``.
     # ``gamma == 0`` skips the call entirely (common ``weight_decay=0``
     # case avoids host overhead and the metadata-table construction).

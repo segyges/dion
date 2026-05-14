@@ -156,6 +156,81 @@ _TORCH_TO_TL = {
 }
 
 
+# Static-metadata cache for ``syre_wd_multi_inplace``. Per call the wrapper
+# uploads 5 small int/float lists to the device and runs a cumsum + cat +
+# arange + repeat_interleave + sub to build the block-decoder tables.
+# Those values are a pure function of ``(post-filter param identities,
+# numels, seeds1, seeds2, offset_bases, stds)`` -- stable across steps for
+# a given param set. We cache them keyed by that tuple and rebuild only
+# the address tensors per call (those genuinely depend on ``data_ptr()``,
+# which can change under ``param.data = new_tensor`` or non-contig
+# contigification).
+#
+# Cap is generous; the working set is bounded by the number of distinct
+# SYRE-bearing shape sub-groups in the optimizer (typically << 64). On
+# overflow we clear wholesale rather than LRU-evict to keep this dead-
+# simple; the next call rebuilds.
+_SYRE_METADATA_CACHE: dict = {}
+_SYRE_METADATA_CACHE_MAXSIZE = 64
+
+
+def _get_or_build_syre_static_metadata(
+    cache_key,
+    numels,
+    seeds1,
+    seeds2,
+    offset_bases,
+    stds,
+    blocks_per_param,
+    total_blocks,
+    n,
+    device,
+):
+    """Return the 7 static metadata tensors for one multi-tensor launch.
+
+    Cache hit: returns the cached tuple unchanged.
+
+    Cache miss: builds ``(numels_t, seeds1_t, seeds2_t, offset_bases_t,
+    stds_t, block_to_param_t, block_within_t)`` -- 5 host->device copies
+    plus a cumsum/cat/arange/repeat_interleave/sub chain -- and stores
+    them under ``cache_key`` before returning. On cap overflow the cache
+    is cleared wholesale; see :data:`_SYRE_METADATA_CACHE` for the
+    invalidation contract.
+    """
+    hit = _SYRE_METADATA_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    numels_t = torch.tensor(numels, dtype=torch.int64, device=device)
+    seeds1_t = torch.tensor(seeds1, dtype=torch.int32, device=device)
+    seeds2_t = torch.tensor(seeds2, dtype=torch.int32, device=device)
+    offset_bases_t = torch.tensor(offset_bases, dtype=torch.int64, device=device)
+    stds_t = torch.tensor(stds, dtype=torch.float32, device=device)
+    blocks_per_param_t = torch.tensor(
+        blocks_per_param, dtype=torch.int32, device=device,
+    )
+    # block_to_param[k] = i  iff block k belongs to param i.
+    block_to_param_t = torch.arange(n, device=device, dtype=torch.int32) \
+        .repeat_interleave(blocks_per_param_t)
+    # block_within[k] = k - cumulative_blocks_before_its_param.
+    cum_blocks = blocks_per_param_t.cumsum(0)
+    starts = torch.cat([
+        torch.zeros(1, dtype=cum_blocks.dtype, device=device),
+        cum_blocks[:-1],
+    ])
+    block_within_t = (
+        torch.arange(total_blocks, device=device, dtype=torch.int32)
+        - starts[block_to_param_t]
+    )
+    meta = (
+        numels_t, seeds1_t, seeds2_t, offset_bases_t, stds_t,
+        block_to_param_t, block_within_t,
+    )
+    if len(_SYRE_METADATA_CACHE) >= _SYRE_METADATA_CACHE_MAXSIZE:
+        _SYRE_METADATA_CACHE.clear()
+    _SYRE_METADATA_CACHE[cache_key] = meta
+    return meta
+
+
 @triton.jit
 def _syre_wd_kernel(
     X_ptr, U_ptr, numel, gamma, seed1, std, seed2, d_bound, offset_base,
@@ -573,7 +648,10 @@ def syre_wd_multi_inplace(
 
     # Filter out zero-numel params -- they would contribute 0 blocks
     # and the metadata-table construction handles them fine, but
-    # carrying them through wastes work.
+    # carrying them through wastes work. The cache key downstream uses
+    # ``flats[i].data_ptr()``, which post-filter naturally encodes the
+    # subset: a param toggling between empty / non-empty across steps
+    # just lands in a different cache entry.
     keep = [i for i, f in enumerate(flats) if f.numel() > 0]
     if not keep:
         return
@@ -591,9 +669,42 @@ def syre_wd_multi_inplace(
     blocks_per_param = [(m + BLOCK_SIZE - 1) // BLOCK_SIZE for m in numels]
     total_blocks = sum(blocks_per_param)
 
-    # Build metadata tensors. The block-to-param / block-within tables
-    # are built with cumsum + arange on GPU (faster than Python list
-    # comprehension for large block counts).
+    # Static metadata (numels / seeds / offset_bases / stds / block
+    # decoder tables) is a pure function of the param-identity tuple
+    # and the explicit input values; fetch from cache, build on miss.
+    # See :func:`_get_or_build_syre_static_metadata`.
+    #
+    # Key on ``flats[i].data_ptr()`` rather than ``id(Xs_kept[i])``:
+    # the optimizer hot path runs ``Xs = to_local(params)`` upstream,
+    # and ``DTensor.to_local()`` returns a *fresh* Python wrapper per
+    # call (even when underlying storage is unchanged), so id-based
+    # keying always misses in FSDP2 / DTensor configurations -- the
+    # exact case where the cache matters most. ``data_ptr()`` is
+    # stable across to_local invocations because the storage doesn't
+    # move; on non-contig params it changes per call (as
+    # ``X.contiguous()`` allocates fresh storage), which correctly
+    # forces a rebuild for that rare path.
+    cache_key = (
+        tuple(f.data_ptr() for f in flats),
+        tuple(numels),
+        tuple(seeds1),
+        tuple(seeds2),
+        tuple(offset_bases),
+        tuple(stds),
+    )
+    (
+        numels_t, seeds1_t, seeds2_t, offset_bases_t, stds_t,
+        block_to_param_t, block_within_t,
+    ) = _get_or_build_syre_static_metadata(
+        cache_key,
+        numels, seeds1, seeds2, offset_bases, stds,
+        blocks_per_param, total_blocks, n, device,
+    )
+
+    # Address tensors stay outside the cache: ``data_ptr()`` changes
+    # under ``param.data = new_tensor`` and under non-contig
+    # contigification (which allocates fresh storage per call). Two
+    # small host->device copies are the price of correctness there.
     x_addrs = torch.tensor(
         [f.data_ptr() for f in flats],
         dtype=torch.int64, device=device,
@@ -605,28 +716,6 @@ def syre_wd_multi_inplace(
         )
     else:
         u_addrs = x_addrs  # dummy; kernel never dereferences
-
-    numels_t = torch.tensor(numels, dtype=torch.int64, device=device)
-    seeds1_t = torch.tensor(seeds1, dtype=torch.int32, device=device)
-    seeds2_t = torch.tensor(seeds2, dtype=torch.int32, device=device)
-    offset_bases_t = torch.tensor(offset_bases, dtype=torch.int64, device=device)
-    stds_t = torch.tensor(stds, dtype=torch.float32, device=device)
-    blocks_per_param_t = torch.tensor(
-        blocks_per_param, dtype=torch.int32, device=device,
-    )
-    # block_to_param[k] = i  iff block k belongs to param i.
-    block_to_param_t = torch.arange(n, device=device, dtype=torch.int32) \
-        .repeat_interleave(blocks_per_param_t)
-    # block_within[k] = k - cumulative_blocks_before_its_param.
-    cum_blocks = blocks_per_param_t.cumsum(0)
-    starts = torch.cat([
-        torch.zeros(1, dtype=cum_blocks.dtype, device=device),
-        cum_blocks[:-1],
-    ])
-    block_within_t = (
-        torch.arange(total_blocks, device=device, dtype=torch.int32)
-        - starts[block_to_param_t]
-    )
 
     grid = (total_blocks,)
     x_tl_dtype = _TORCH_TO_TL[x_dtype]

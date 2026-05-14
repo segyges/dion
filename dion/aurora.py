@@ -33,6 +33,16 @@ from .syre_config import (  # noqa: F401  (re-exported)
 )
 
 
+# Cap on per-group SYRE-metadata cache entries. The working set in normal
+# use is bounded by the number of distinct shape sub-groups within one
+# parameter group (small). The cap is a safety net for the
+# gradient-accumulation / partial-grad case where the
+# ``p.grad is not None`` filter toggles subsets across steps. Wholesale-
+# clear on overflow rather than LRU-evict to keep this dead simple; next
+# call rebuilds.
+_SYRE_META_CACHE_MAXSIZE = 16
+
+
 
 class Aurora(DistributedOrthoBase):
     """
@@ -367,6 +377,67 @@ class Aurora(DistributedOrthoBase):
             return self._device_rank * padded_local_size
         return 0
 
+    def _get_or_build_syre_meta(
+        self,
+        group: dict,
+        params: List[Tensor],
+        advanced_removal: bool,
+        syre_std_scalar: Optional[float],
+        syre_std_mode: Optional[Union[str, Callable[[Tensor], float]]],
+    ) -> Tuple[List[int], List[int], List[int], List[float]]:
+        """Build (or fetch from cache) the per-param SYRE metadata for a
+        sub-group of params.
+
+        Returns ``(seeds1, seeds2, offset_bases, stds)``. The underlying
+        values are already cached on ``self.state[p]`` (seeds, std) or
+        derived from stable topology (offset_base), so for a given param
+        identity tuple the result is invariant across steps. The cache
+        here just avoids the per-step N dict-lookups + method-call chain
+        in the hot path.
+
+        Cache lives on the group dict under ``_syre_meta_cache`` as
+        ``{id_tuple: (seeds1, seeds2, offset_bases, stds)}``. Keyed by
+        ``tuple(id(p) for p in params)`` so different shape sub-groups
+        within one parameter group each get their own entry; growth is
+        bounded in normal use by the number of distinct shape sub-groups.
+
+        A wholesale-clear cap (``_SYRE_META_CACHE_MAXSIZE``) guards
+        against degenerate growth when the ``p.grad is not None`` filter
+        toggles across steps (gradient accumulation, conditional
+        freezing): each distinct filtered subset would otherwise accrue
+        a new entry. On overflow we clear and rebuild from scratch.
+
+        Safe under `id` reuse: optimizer parameters are not freed during
+        a live optimizer, and ``add_param_group`` adds (never removes)
+        entries -- so an id collision would require a parameter to die
+        and a new tensor be allocated at the same address while the
+        optimizer is still tracking the old one. We don't try to defend
+        against that; ``optimizer.state_dict() / load_state_dict()`` is
+        the supported way to reset.
+        """
+        key = tuple(id(p) for p in params)
+        cache = group.setdefault("_syre_meta_cache", {})
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        if len(cache) >= _SYRE_META_CACHE_MAXSIZE:
+            cache.clear()
+        seeds1: List[int] = []
+        seeds2: List[int] = []
+        offset_bases: List[int] = []
+        stds: List[float] = []
+        for p in params:
+            s1, s2 = self._get_or_init_syre_seeds(p, advanced_removal)
+            seeds1.append(s1)
+            seeds2.append(s2)
+            offset_bases.append(self._compute_syre_offset_base(p))
+            stds.append(
+                self._get_or_init_syre_std(p, syre_std_scalar, syre_std_mode)
+            )
+        meta = (seeds1, seeds2, offset_bases, stds)
+        cache[key] = meta
+        return meta
+
     def _create_ortho_tasks(
         self, param_groups: List[dict]
     ) -> Generator["AsyncTask", None, None]:
@@ -467,28 +538,18 @@ class Aurora(DistributedOrthoBase):
                         megabatch_args = {**update_args, "process_group": None}
                     shard_dim = sharded_tensor_dim
 
-                # Per-param SYRE state. Drawn lazily on first use; keyed by
-                # the original (pre-head-split) param object so it round-
-                # trips through ``state_dict``.
+                # Per-param SYRE state. Cached per shape sub-group on the
+                # group dict -- seeds / stds are already lazily drawn into
+                # ``self.state[p]`` (round-tripping through ``state_dict``)
+                # and the offset_base is derived from stable topology; the
+                # cache avoids rebuilding the four lists every step.
                 if syre_wd:
-                    syre_seeds1: List[int] = []
-                    syre_seeds2: List[int] = []
-                    syre_offset_bases: List[int] = []
-                    syre_stds: List[float] = []
-                    for p in original_params:
-                        s1, s2 = self._get_or_init_syre_seeds(
-                            p, advanced_removal
+                    syre_seeds1, syre_seeds2, syre_offset_bases, syre_stds = (
+                        self._get_or_build_syre_meta(
+                            group, original_params, advanced_removal,
+                            syre_std_scalar, syre_std_mode,
                         )
-                        syre_seeds1.append(s1)
-                        syre_seeds2.append(s2)
-                        syre_offset_bases.append(
-                            self._compute_syre_offset_base(p)
-                        )
-                        syre_stds.append(
-                            self._get_or_init_syre_std(
-                                p, syre_std_scalar, syre_std_mode,
-                            )
-                        )
+                    )
                     # When ``syre_std_mode`` is in use, the per-param
                     # sigma_0 set is only known once params are seen; fire
                     # the Theorem-3 / AR-floor warning at most once per
@@ -561,20 +622,14 @@ class Aurora(DistributedOrthoBase):
             syre_std_scalar = group["syre_std"]
             syre_std_mode = group.get("syre_std_mode")
 
-            syre_seeds1: List[int] = []
-            syre_seeds2: List[int] = []
-            syre_offset_bases: List[int] = []
-            syre_stds: List[float] = []
-            for p in params:
-                s1, s2 = self._get_or_init_syre_seeds(p, advanced_removal)
-                syre_seeds1.append(s1)
-                syre_seeds2.append(s2)
-                syre_offset_bases.append(self._compute_syre_offset_base(p))
-                syre_stds.append(
-                    self._get_or_init_syre_std(
-                        p, syre_std_scalar, syre_std_mode,
-                    )
+            # Per-param SYRE metadata, cached on the group dict. See
+            # ``_get_or_build_syre_meta`` for the cache contract.
+            syre_seeds1, syre_seeds2, syre_offset_bases, syre_stds = (
+                self._get_or_build_syre_meta(
+                    group, params, advanced_removal,
+                    syre_std_scalar, syre_std_mode,
                 )
+            )
             if (
                 syre_std_mode is not None
                 and not group.get("_syre_sigma0_checked", False)
@@ -785,8 +840,52 @@ def aurora_update_post_orthogonalize(
             Us=list(U) if cautious_wd else None,
         )
 
-    for x, u in zip(X, U):
-        x.sub_(u, alpha=adj_lr_f)
+    # Multi-tensor apply: one fused launch over the list instead of N
+    # python-side ``sub_`` dispatches. Semantically identical.
+    torch._foreach_sub_(list(X), list(U), alpha=adj_lr_f)
+
+
+@torch.compile(fullgraph=True)
+def _aurora_pp_init(X_t: Tensor, eps_f: float) -> Tuple[Tensor, Tensor, Tensor]:
+    """Aurora preconditioned-polar setup, compile-fused.
+
+    Returns ``(X32, D, D * X32)`` where ``D = 1 / row_norm(X32).clamp(eps_f)``.
+    Caller passes ``D * X32`` to ``base_polar`` and keeps ``X32`` / ``D``
+    alive across the iteration loop so :func:`_aurora_pp_step` can update
+    ``D`` and reform ``D * X32`` without re-casting.
+
+    Four eager launches (``to``, ``norm``, ``clamp``, ``reciprocal``,
+    ``mul``) collapse to one fused kernel under compile.
+    """
+    X32 = X_t.to(torch.float32)
+    row_norm = X32.norm(dim=-1, keepdim=True).clamp(min=eps_f)
+    D = 1.0 / row_norm
+    return X32, D, D * X32
+
+
+@torch.compile(fullgraph=True)
+def _aurora_pp_step(
+    U: Tensor,
+    X32: Tensor,
+    D: Tensor,
+    target_row_sq: float,
+    pp_beta: float,
+    eps_sq: float,
+) -> Tuple[Tensor, Tensor]:
+    """Aurora preconditioned-polar iteration body, compile-fused.
+
+    Given the prior iteration's ``U`` and the cached ``X32`` / ``D``,
+    updates ``D *= (target_row_sq / ||U_i||^2)^pp_beta`` and returns
+    ``(D_new, D_new * X32)`` for the next ``base_polar`` call.
+
+    Six pointwise launches (``to``, ``pow(2)``, ``sum``, ``clamp``,
+    ``div``, ``pow(pp_beta)``, ``mul``, ``mul``) collapse to one fused
+    kernel under compile. Specializes per ``(target_row_sq, pp_beta,
+    eps_sq)`` Python scalar combo, which is per-shape-stable.
+    """
+    row_sq = U.to(torch.float32).pow(2).sum(dim=-1, keepdim=True).clamp(min=eps_sq)
+    D = D * (target_row_sq / row_sq).pow(pp_beta)
+    return D, D * X32
 
 
 def make_aurora_polar(
@@ -807,6 +906,12 @@ def make_aurora_polar(
     pathway (the same one Muon/NorMuon use), so the output here has
     spectral norm at most 1 and unit row-norm structure.
 
+    The pointwise interludes between ``base_polar`` calls are
+    compile-fused via :func:`_aurora_pp_init` (pre-loop setup) and
+    :func:`_aurora_pp_step` (per-iteration diagonal update). The
+    ``base_polar`` calls themselves stay outside the compile boundary
+    because they may dispatch to a Triton kernel.
+
     Args:
         base_polar: standard polar / Newton-Schulz function.
         pp_iterations: number of preconditioned-polar rounds.
@@ -825,34 +930,33 @@ def make_aurora_polar(
         m, n = X.size(-2), X.size(-1)
 
         if m == n:
-            U = base_polar(X, epsilon=epsilon)
-        else:
-            transposed = m < n
-            X_t = X.mT if transposed else X
-            mm = max(m, n)
-            nn = min(m, n)
-            # Use a Python float for clamp(min=...) to avoid device-mismatch
-            # when ``epsilon`` is a CPU Tensor (the megabatch path). Prefer the
-            # value baked in at wrapper-construction time.
-            if baked_eps is not None:
-                eps_f = baked_eps
-            elif isinstance(epsilon, Tensor):
-                eps_f = epsilon.item()
-            else:
-                eps_f = float(epsilon)
-            X32 = X_t.to(torch.float32)
-            target_row_sq = nn / mm
-            row_norm = X32.norm(dim=-1, keepdim=True).clamp(min=eps_f)
-            D = 1.0 / row_norm
-            eps_sq = eps_f * eps_f
-            U = base_polar(D * X32, epsilon=epsilon)
-            for k in range(1, pp_iterations):
-                row_sq = U.to(torch.float32).pow(2).sum(dim=-1, keepdim=True).clamp(min=eps_sq)
-                D = D * (target_row_sq / row_sq).pow(pp_beta)
-                U = base_polar(D * X32, epsilon=epsilon)
-            if transposed:
-                U = U.mT
+            return base_polar(X, epsilon=epsilon)
 
+        transposed = m < n
+        X_t = X.mT if transposed else X
+        mm = max(m, n)
+        nn = min(m, n)
+        # Use a Python float for clamp(min=...) to avoid device-mismatch
+        # when ``epsilon`` is a CPU Tensor (the megabatch path). Prefer the
+        # value baked in at wrapper-construction time.
+        if baked_eps is not None:
+            eps_f = baked_eps
+        elif isinstance(epsilon, Tensor):
+            eps_f = epsilon.item()
+        else:
+            eps_f = float(epsilon)
+        target_row_sq = nn / mm
+        eps_sq = eps_f * eps_f
+
+        X32, D, DX = _aurora_pp_init(X_t, eps_f)
+        U = base_polar(DX, epsilon=epsilon)
+        for _ in range(1, pp_iterations):
+            D, DX = _aurora_pp_step(
+                U, X32, D, target_row_sq, pp_beta, eps_sq,
+            )
+            U = base_polar(DX, epsilon=epsilon)
+        if transposed:
+            U = U.mT
         return U
 
     return aurora_polar

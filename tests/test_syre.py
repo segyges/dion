@@ -603,6 +603,152 @@ def test_syre_advanced_removal_additive_form_preserves_distinctness():
 
 
 # ---------------------------------------------------------------------------
+# 5.5. Multi-tensor kernel parity.
+# ---------------------------------------------------------------------------
+
+
+@gpu_only
+@pytest.mark.parametrize("advanced_removal", [False, True])
+@pytest.mark.parametrize("cautious", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_syre_multi_matches_single_loop(advanced_removal, cautious, dtype):
+    """``syre_wd_multi_inplace`` must produce bit-identical results to a
+    loop over ``syre_wd_inplace`` for every variant. Covers the full
+    cross-product of (basic/AR) x (non-cautious/cautious) x (fp32/bf16).
+    """
+    from dion.syre import syre_wd_inplace, syre_wd_multi_inplace
+
+    torch.manual_seed(0)
+    shapes = [(127,), (256, 8), (1023,), (33, 99), (8, 4, 7)]
+    n = len(shapes)
+    seeds1 = list(range(1, n + 1))
+    seeds2 = list(range(101, 101 + n))
+    offset_bases = [i * 1024 for i in range(n)]
+    gamma = 3e-5
+    std = 1e-3
+    d_bound = 1e-4
+
+    Xs_ref = [torch.randn(*s, device="cuda", dtype=dtype) for s in shapes]
+    Xs_mul = [x.clone() for x in Xs_ref]
+    if cautious:
+        Us = [torch.randn(*s, device="cuda", dtype=dtype) for s in shapes]
+        Us_ref = [u.clone() for u in Us]
+        Us_mul = [u.clone() for u in Us]
+    else:
+        Us_ref = [None] * n
+        Us_mul = None
+
+    for i in range(n):
+        syre_wd_inplace(
+            Xs_ref[i], gamma=gamma, seed1=seeds1[i], std=std,
+            seed2=seeds2[i], d_bound=d_bound,
+            advanced_removal=advanced_removal,
+            offset_base=offset_bases[i],
+            U=Us_ref[i],
+        )
+
+    syre_wd_multi_inplace(
+        Xs_mul, gamma=gamma, seeds1=seeds1, std=std,
+        seeds2=seeds2, d_bound=d_bound,
+        advanced_removal=advanced_removal,
+        offset_bases=offset_bases,
+        Us=Us_mul,
+    )
+
+    for i in range(n):
+        assert torch.equal(Xs_ref[i], Xs_mul[i]), (
+            f"param {i} (shape={shapes[i]}, dtype={dtype}): max abs diff "
+            f"= {(Xs_ref[i] - Xs_mul[i]).abs().max().item():.3e}"
+        )
+
+
+@gpu_only
+def test_syre_multi_empty_list_is_noop():
+    from dion.syre import syre_wd_multi_inplace
+    # No-op; must not raise.
+    syre_wd_multi_inplace(
+        [], gamma=1e-3, seeds1=[], std=0.01,
+        seeds2=[], d_bound=1e-4,
+        advanced_removal=False, offset_bases=[],
+    )
+
+
+@gpu_only
+def test_syre_multi_zero_gamma_is_noop():
+    from dion.syre import syre_wd_multi_inplace
+
+    torch.manual_seed(0)
+    Xs = [torch.randn(128, device="cuda") for _ in range(3)]
+    snap = [x.clone() for x in Xs]
+    syre_wd_multi_inplace(
+        Xs, gamma=0.0, seeds1=[1, 2, 3], std=0.1,
+        seeds2=[0, 0, 0], d_bound=0.0,
+        advanced_removal=False, offset_bases=[0, 0, 0],
+    )
+    for x, s in zip(Xs, snap):
+        assert torch.equal(x, s)
+
+
+@gpu_only
+def test_syre_multi_skips_empty_tensors():
+    """An empty param mixed in with non-empty ones must be silently
+    skipped (no kernel work for it), and the non-empty ones must produce
+    the same result as if the empty had not been there at all.
+    """
+    from dion.syre import syre_wd_inplace, syre_wd_multi_inplace
+
+    torch.manual_seed(0)
+    x1 = torch.randn(64, device="cuda")
+    x_empty = torch.empty(0, device="cuda")
+    x2 = torch.randn(33, device="cuda")
+    ref1 = x1.clone()
+    ref2 = x2.clone()
+
+    syre_wd_inplace(ref1, gamma=1e-3, seed1=1, std=0.01,
+                    seed2=0, d_bound=0.0,
+                    advanced_removal=False, offset_base=0)
+    syre_wd_inplace(ref2, gamma=1e-3, seed1=3, std=0.01,
+                    seed2=0, d_bound=0.0,
+                    advanced_removal=False, offset_base=0)
+
+    syre_wd_multi_inplace(
+        [x1, x_empty, x2], gamma=1e-3, seeds1=[1, 2, 3], std=0.01,
+        seeds2=[0, 0, 0], d_bound=0.0,
+        advanced_removal=False, offset_bases=[0, 0, 0],
+    )
+    assert torch.equal(x1, ref1)
+    assert x_empty.numel() == 0
+    assert torch.equal(x2, ref2)
+
+
+@gpu_only
+def test_syre_multi_rejects_mismatched_dtype():
+    from dion.syre import syre_wd_multi_inplace
+
+    x1 = torch.randn(32, device="cuda", dtype=torch.float32)
+    x2 = torch.randn(32, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="dtype"):
+        syre_wd_multi_inplace(
+            [x1, x2], gamma=1e-3, seeds1=[1, 2], std=0.01,
+            seeds2=[0, 0], d_bound=0.0,
+            advanced_removal=False, offset_bases=[0, 0],
+        )
+
+
+@gpu_only
+def test_syre_multi_rejects_unsupported_dtype():
+    from dion.syre import syre_wd_multi_inplace
+
+    x = torch.randn(32, device="cuda", dtype=torch.float64)
+    with pytest.raises(TypeError, match="unsupported dtype"):
+        syre_wd_multi_inplace(
+            [x], gamma=1e-3, seeds1=[1], std=0.01,
+            seeds2=[0], d_bound=0.0,
+            advanced_removal=False, offset_bases=[0],
+        )
+
+
+# ---------------------------------------------------------------------------
 # 6. Cautious-SYRE math.
 # ---------------------------------------------------------------------------
 

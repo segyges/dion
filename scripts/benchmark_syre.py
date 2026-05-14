@@ -32,7 +32,7 @@ from typing import List, Tuple
 import torch
 
 from dion.aurora import Aurora
-from dion.syre import syre_wd_inplace
+from dion.syre import syre_wd_inplace, syre_wd_multi_inplace
 
 
 def transformer_matrix_shapes(
@@ -141,7 +141,7 @@ def sharded_syre_extrapolation(shapes, syre_std, gamma):
         seeds2 = list(range(10001, 10001 + n))
         offs = [0] * n
 
-        def step_basic():
+        def step_loop_basic():
             for p, s1, s2, o in zip(local_params, seeds1, seeds2, offs):
                 syre_wd_inplace(
                     p, gamma=gamma, seed1=s1, std=syre_std,
@@ -149,7 +149,7 @@ def sharded_syre_extrapolation(shapes, syre_std, gamma):
                     advanced_removal=False, offset_base=o,
                 )
 
-        def step_ar():
+        def step_loop_ar():
             for p, s1, s2, o in zip(local_params, seeds1, seeds2, offs):
                 syre_wd_inplace(
                     p, gamma=gamma, seed1=s1, std=syre_std,
@@ -157,26 +157,46 @@ def sharded_syre_extrapolation(shapes, syre_std, gamma):
                     advanced_removal=True, offset_base=o,
                 )
 
+        def step_multi_basic():
+            syre_wd_multi_inplace(
+                local_params, gamma=gamma, seeds1=seeds1, std=syre_std,
+                seeds2=seeds2, d_bound=0.1 * syre_std,
+                advanced_removal=False, offset_bases=offs,
+            )
+
+        def step_multi_ar():
+            syre_wd_multi_inplace(
+                local_params, gamma=gamma, seeds1=seeds1, std=syre_std,
+                seeds2=seeds2, d_bound=0.1 * syre_std,
+                advanced_removal=True, offset_bases=offs,
+            )
+
         # Warm + time.
         for _ in range(3):
-            step_basic(); step_ar()
+            step_loop_basic(); step_loop_ar()
+            step_multi_basic(); step_multi_ar()
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(20):
-            step_basic()
-        torch.cuda.synchronize()
-        t_basic = (time.perf_counter() - t0) / 20
-        t0 = time.perf_counter()
-        for _ in range(20):
-            step_ar()
-        torch.cuda.synchronize()
-        t_ar = (time.perf_counter() - t0) / 20
 
-        # Aggregate local numel for context.
+        def time_n(fn, n=20):
+            t0 = time.perf_counter()
+            for _ in range(n):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / n
+
+        t_loop_basic = time_n(step_loop_basic)
+        t_loop_ar    = time_n(step_loop_ar)
+        t_multi_basic = time_n(step_multi_basic)
+        t_multi_ar    = time_n(step_multi_ar)
+
         local_total = sum(p.numel() for p in local_params)
         print(f"  W={W:>4}:  local shard total = {local_total/1e6:7.1f}M elements")
-        print(f"           SYRE       step: {t_basic*1e3:7.3f} ms")
-        print(f"           SYRE-AR    step: {t_ar*1e3:7.3f} ms")
+        print(f"           per-param  SYRE      : {t_loop_basic*1e3:7.3f} ms  "
+              f"-> multi: {t_multi_basic*1e3:7.3f} ms  "
+              f"(speedup {t_loop_basic/t_multi_basic:5.1f}x)")
+        print(f"           per-param  SYRE-AR   : {t_loop_ar*1e3:7.3f} ms  "
+              f"-> multi: {t_multi_ar*1e3:7.3f} ms  "
+              f"(speedup {t_loop_ar/t_multi_ar:5.1f}x)")
 
         del local_params
         gc.collect()

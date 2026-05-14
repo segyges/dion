@@ -98,12 +98,22 @@ AR's signal-to-basic-SYRE ratio is ``d_bound ~ sigma_0``, which is
 why bf16's ~7-bit relative ulp swallows AR regardless of ``gamma``.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+
+# Storage-dtype dispatch for the multi-tensor kernel. Per-call all
+# tensors must share dtype (validated in the wrapper); the dtype is
+# baked in as a ``tl.constexpr`` so the kernel specializes per dtype.
+_TORCH_TO_TL = {
+    torch.float32: tl.float32,
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+}
 
 
 @triton.jit
@@ -229,3 +239,272 @@ def syre_wd_inplace(
 
     if needs_copy_back:
         X.copy_(X_contig)
+
+
+@triton.jit
+def _syre_wd_multi_kernel(
+    X_ptrs_ptr,           # *int64, length n_params, raw addresses of X[i].view(-1)
+    U_ptrs_ptr,           # *int64, length n_params, raw addresses of U[i] (or dummies)
+    numels_ptr,           # *int64, length n_params
+    seeds1_ptr,           # *int32, length n_params
+    seeds2_ptr,           # *int32, length n_params
+    offset_bases_ptr,     # *int64, length n_params
+    block_to_param_ptr,   # *int32, length total_blocks
+    block_within_ptr,     # *int32, length total_blocks
+    gamma, std, d_bound,
+    BLOCK_SIZE: tl.constexpr,
+    ADVANCED_REMOVAL: tl.constexpr,
+    CAUTIOUS: tl.constexpr,
+    X_STORAGE_DTYPE: tl.constexpr,
+    U_STORAGE_DTYPE: tl.constexpr,
+):
+    """Multi-tensor SYRE WD kernel.
+
+    One program per (param_idx, block_within_param) pair. ``program_id``
+    is a flat index over all blocks across all parameters; the lookup
+    tables ``block_to_param`` / ``block_within`` decode it into a
+    (param_idx, block_offset_within_param) pair, then per-param metadata
+    (raw X pointer, numel, seeds, offset_base) is loaded from the
+    indirection tables.
+
+    Semantics are bit-identical to looping ``_syre_wd_kernel`` over each
+    parameter individually. The fusion saves only launch overhead --
+    each program does the same arithmetic.
+
+    X and U may have different dtypes (Aurora's post-orth path holds X
+    in fp32 master and U in bf16-ish update form), but all X[i] share
+    ``X_STORAGE_DTYPE`` and all U[i] share ``U_STORAGE_DTYPE`` per launch
+    (validated in the wrapper).
+    """
+    pid = tl.program_id(0)
+    param_idx = tl.load(block_to_param_ptr + pid)
+    block_within = tl.load(block_within_ptr + pid)
+
+    numel = tl.load(numels_ptr + param_idx)
+    seed1 = tl.load(seeds1_ptr + param_idx)
+    seed2 = tl.load(seeds2_ptr + param_idx)
+    offset_base = tl.load(offset_bases_ptr + param_idx)
+
+    offsets = block_within.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    x_addr = tl.load(X_ptrs_ptr + param_idx)
+    x_ptr = x_addr.to(tl.pointer_type(X_STORAGE_DTYPE))
+
+    theta = tl.load(x_ptr + offsets, mask=mask)
+    theta_f32 = theta.to(tl.float32)
+
+    global_offsets = offsets + offset_base
+    theta_0 = tl.randn(seed1, global_offsets) * std
+    diff = theta_f32 - theta_0
+
+    if ADVANCED_REMOVAL:
+        # See additive-form note in _syre_wd_kernel above.
+        xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
+        diff = diff + diff * xi
+
+    if CAUTIOUS:
+        u_addr = tl.load(U_ptrs_ptr + param_idx)
+        u_ptr = u_addr.to(tl.pointer_type(U_STORAGE_DTYPE))
+        u_f32 = tl.load(u_ptr + offsets, mask=mask).to(tl.float32)
+        diff = tl.where(u_f32 * theta_f32 >= 0.0, diff, 0.0)
+
+    result = theta_f32 - gamma * diff
+    tl.store(x_ptr + offsets, result.to(X_STORAGE_DTYPE), mask=mask)
+
+
+def syre_wd_multi_inplace(
+    Xs: List[Tensor],
+    gamma: float,
+    seeds1: List[int],
+    std: float,
+    seeds2: List[int],
+    d_bound: float,
+    advanced_removal: bool,
+    offset_bases: List[int],
+    Us: Optional[List[Tensor]] = None,
+):
+    """Apply SYRE weight decay in-place to a list of tensors with one
+    Triton launch.
+
+    Semantically equivalent to looping :func:`syre_wd_inplace` over each
+    ``(X, seed1, seed2, offset_base)`` (and ``U`` when cautious), but
+    pays per-launch overhead once instead of ``N`` times. Designed for
+    sharded clusters where per-rank shards are small and ``N`` launches
+    of ~18 us each dominate the SYRE step.
+
+    All inputs share ``gamma``, ``std``, ``d_bound``, ``advanced_removal``,
+    and ``cautious`` (set by ``Us is not None``). Per-param state lives
+    in the lists.
+
+    Args:
+        Xs: parameter tensors (decayed in place). All must share device
+            and dtype. Non-contiguous tensors are temporarily contiguified
+            and copied back, as in the single-tensor wrapper. Empty
+            tensors are skipped.
+        gamma: scalar decay coefficient. ``0`` is a no-op (returns
+            immediately).
+        seeds1: per-param ``seed1`` (theta_0 PRNG seed).
+        std: scalar scale for ``theta_0`` (shared across all params).
+        seeds2: per-param ``seed2`` (AR multiplier PRNG seed). Ignored
+            unless ``advanced_removal=True``; any value works otherwise.
+        d_bound: half-width of the AR uniform interval. Ignored unless
+            ``advanced_removal=True``.
+        advanced_removal: SYRE-AR variant flag (uniform across the batch).
+        offset_bases: per-param starting Philox offset for global indexing
+            in sharded settings.
+        Us: optional list of update tensors for the cautious mask. If
+            provided, must have the same length as ``Xs`` and each
+            ``U[i]`` must match ``X[i]`` in numel.
+    """
+    if not Xs or gamma == 0.0:
+        return
+
+    n_in = len(Xs)
+    assert len(seeds1) == n_in, "seeds1 length must match Xs"
+    assert len(seeds2) == n_in, "seeds2 length must match Xs"
+    assert len(offset_bases) == n_in, "offset_bases length must match Xs"
+    cautious = Us is not None
+    if cautious:
+        assert len(Us) == n_in, "Us length must match Xs"
+
+    device = Xs[0].device
+    x_dtype = Xs[0].dtype
+    if x_dtype not in _TORCH_TO_TL:
+        raise TypeError(
+            f"syre_wd_multi_inplace: unsupported dtype {x_dtype}. "
+            f"Supported: {list(_TORCH_TO_TL)}."
+        )
+    for i, X in enumerate(Xs):
+        if X.device != device:
+            raise ValueError(
+                f"Xs[{i}].device={X.device} != Xs[0].device={device}"
+            )
+        if X.dtype != x_dtype:
+            raise ValueError(
+                f"Xs[{i}].dtype={X.dtype} != Xs[0].dtype={x_dtype}"
+            )
+
+    # ``U`` can have a different dtype from ``X`` (Aurora's post-orth
+    # update tensors are bf16-ish even when params are fp32). We allow
+    # that, but require U's dtype to be uniform across the U list.
+    u_dtype = None
+    if cautious:
+        u_dtype = Us[0].dtype
+        if u_dtype not in _TORCH_TO_TL:
+            raise TypeError(
+                f"syre_wd_multi_inplace: unsupported U dtype {u_dtype}. "
+                f"Supported: {list(_TORCH_TO_TL)}."
+            )
+        for i, U in enumerate(Us):
+            if U.dtype != u_dtype:
+                raise ValueError(
+                    f"Us[{i}].dtype={U.dtype} != Us[0].dtype={u_dtype}"
+                )
+            if U.device != device:
+                raise ValueError(
+                    f"Us[{i}].device={U.device} != Xs[0].device={device}"
+                )
+
+    BLOCK_SIZE = 1024
+
+    # Contiguify (rare for FSDP2 local shards) and flatten. Keep the
+    # contig tensors alive so their storage isn't freed before launch.
+    contigs: List[Tensor] = []
+    copy_backs: List[tuple] = []
+    flats: List[Tensor] = []
+    for X in Xs:
+        if X.is_contiguous():
+            X_c = X
+        else:
+            X_c = X.contiguous()
+            copy_backs.append((X, X_c))
+        contigs.append(X_c)
+        flats.append(X_c.view(-1))
+
+    u_flats: List[Tensor] = []
+    if cautious:
+        for X, U in zip(Xs, Us):
+            if U.numel() != X.numel():
+                raise ValueError(
+                    f"U.numel()={U.numel()} != X.numel()={X.numel()}"
+                )
+            u_flats.append(U.reshape(-1))
+
+    # Filter out zero-numel params -- they would contribute 0 blocks
+    # and the metadata-table construction handles them fine, but
+    # carrying them through wastes work.
+    keep = [i for i, f in enumerate(flats) if f.numel() > 0]
+    if not keep:
+        return
+    if len(keep) != n_in:
+        flats = [flats[i] for i in keep]
+        seeds1 = [seeds1[i] for i in keep]
+        seeds2 = [seeds2[i] for i in keep]
+        offset_bases = [offset_bases[i] for i in keep]
+        if cautious:
+            u_flats = [u_flats[i] for i in keep]
+
+    n = len(flats)
+    numels = [int(f.numel()) for f in flats]
+    blocks_per_param = [(m + BLOCK_SIZE - 1) // BLOCK_SIZE for m in numels]
+    total_blocks = sum(blocks_per_param)
+
+    # Build metadata tensors. The block-to-param / block-within tables
+    # are built with cumsum + arange on GPU (faster than Python list
+    # comprehension for large block counts).
+    x_addrs = torch.tensor(
+        [f.data_ptr() for f in flats],
+        dtype=torch.int64, device=device,
+    )
+    if cautious:
+        u_addrs = torch.tensor(
+            [u.data_ptr() for u in u_flats],
+            dtype=torch.int64, device=device,
+        )
+    else:
+        u_addrs = x_addrs  # dummy; kernel never dereferences
+
+    numels_t = torch.tensor(numels, dtype=torch.int64, device=device)
+    seeds1_t = torch.tensor(seeds1, dtype=torch.int32, device=device)
+    seeds2_t = torch.tensor(seeds2, dtype=torch.int32, device=device)
+    offset_bases_t = torch.tensor(offset_bases, dtype=torch.int64, device=device)
+    blocks_per_param_t = torch.tensor(
+        blocks_per_param, dtype=torch.int32, device=device,
+    )
+    # block_to_param[k] = i  iff block k belongs to param i.
+    block_to_param_t = torch.arange(n, device=device, dtype=torch.int32) \
+        .repeat_interleave(blocks_per_param_t)
+    # block_within[k] = k - cumulative_blocks_before_its_param.
+    cum_blocks = blocks_per_param_t.cumsum(0)
+    starts = torch.cat([
+        torch.zeros(1, dtype=cum_blocks.dtype, device=device),
+        cum_blocks[:-1],
+    ])
+    block_within_t = (
+        torch.arange(total_blocks, device=device, dtype=torch.int32)
+        - starts[block_to_param_t]
+    )
+
+    grid = (total_blocks,)
+    x_tl_dtype = _TORCH_TO_TL[x_dtype]
+    # When non-cautious, U pointers are dummies and the U_STORAGE_DTYPE
+    # constexpr branch is dead-code-eliminated. Pass X's dtype to keep
+    # the kernel cache key small (one fewer dimension when CAUTIOUS=False).
+    u_tl_dtype = _TORCH_TO_TL[u_dtype] if cautious else x_tl_dtype
+
+    with torch.cuda.device(device):
+        _syre_wd_multi_kernel[grid](
+            x_addrs, u_addrs,
+            numels_t, seeds1_t, seeds2_t, offset_bases_t,
+            block_to_param_t, block_within_t,
+            gamma, std, d_bound,
+            BLOCK_SIZE=BLOCK_SIZE,
+            ADVANCED_REMOVAL=advanced_removal,
+            CAUTIOUS=cautious,
+            X_STORAGE_DTYPE=x_tl_dtype,
+            U_STORAGE_DTYPE=u_tl_dtype,
+        )
+
+    for X, X_c in copy_backs:
+        X.copy_(X_c)

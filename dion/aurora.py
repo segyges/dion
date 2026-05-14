@@ -832,29 +832,27 @@ def aurora_update_post_orthogonalize(
     post-orth, with the foreach fast path and the SYRE branch coexisting
     in one function.
     """
-    from .syre import syre_wd_inplace
+    from .syre import syre_wd_multi_inplace
 
     gamma = float(base_lr) * float(weight_decay)
     adj_lr_f = float(adjusted_lr)
 
-    # Skip the per-param SYRE launch entirely when gamma == 0 (e.g.
-    # weight_decay=0). ``syre_wd_inplace`` early-returns internally,
-    # but the per-param Python overhead is still measurable for groups
-    # with many small params. Mirrors the guard in
-    # ``scalar_opts.adamw_update_foreach_syre``.
+    # Single fused SYRE launch over the whole list. On sharded clusters
+    # (W >= 4) this is where the win is -- per-param launch overhead
+    # would otherwise plateau the SYRE step at ~N * 18us. See
+    # ``scripts/benchmark_syre.py``.
     if gamma > 0.0:
-        for i, (x, u) in enumerate(zip(X, U)):
-            syre_wd_inplace(
-                x,
-                gamma=gamma,
-                seed1=syre_seeds1[i],
-                std=syre_std,
-                seed2=syre_seeds2[i],
-                d_bound=d_bound,
-                advanced_removal=advanced_removal,
-                offset_base=syre_offset_bases[i],
-                U=u if cautious_wd else None,
-            )
+        syre_wd_multi_inplace(
+            Xs=list(X),
+            gamma=gamma,
+            seeds1=syre_seeds1,
+            std=syre_std,
+            seeds2=syre_seeds2,
+            d_bound=d_bound,
+            advanced_removal=advanced_removal,
+            offset_bases=syre_offset_bases,
+            Us=list(U) if cautious_wd else None,
+        )
 
     for x, u in zip(X, U):
         x.sub_(u, alpha=adj_lr_f)

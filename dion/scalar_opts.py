@@ -301,7 +301,7 @@ def adamw_update_foreach_syre(
     mask source is the bias-corrected update direction, not the SYRE
     diff itself (CWD applied to SYRE).
     """
-    from .syre import syre_wd_inplace
+    from .syre import syre_wd_multi_inplace
 
     if not X:
         return
@@ -340,22 +340,22 @@ def adamw_update_foreach_syre(
     # mask and the final param add.
     update_dirs = torch._foreach_div(M, denom)
 
-    # SYRE WD step. ``gamma == 0`` is a no-op inside the kernel, but
-    # we also skip the launch loop entirely to keep host overhead low
-    # for the common ``weight_decay=0`` case.
+    # SYRE WD step. Single fused launch over the list -- see
+    # ``syre_wd_multi_inplace`` and ``scripts/benchmark_syre.py``.
+    # ``gamma == 0`` skips the call entirely (common ``weight_decay=0``
+    # case avoids host overhead and the metadata-table construction).
     if gamma > 0.0:
-        for i, x in enumerate(X):
-            syre_wd_inplace(
-                x,
-                gamma=gamma,
-                seed1=syre_seeds1[i],
-                std=syre_std,
-                seed2=syre_seeds2[i],
-                d_bound=d_bound,
-                advanced_removal=advanced_removal,
-                offset_base=syre_offset_bases[i],
-                U=update_dirs[i] if cautious_wd else None,
-            )
+        syre_wd_multi_inplace(
+            Xs=list(X),
+            gamma=gamma,
+            seeds1=syre_seeds1,
+            std=syre_std,
+            seeds2=syre_seeds2,
+            d_bound=d_bound,
+            advanced_removal=advanced_removal,
+            offset_bases=syre_offset_bases,
+            Us=list(update_dirs) if cautious_wd else None,
+        )
 
     # X = X - adj_lr * update_dir.
     torch._foreach_add_(X, update_dirs, alpha=-adj_lr_f)

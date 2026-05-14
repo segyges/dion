@@ -272,7 +272,7 @@ def adamw_update_foreach_syre(
     cautious_wd: bool,
     syre_seeds1: List[int],
     syre_seeds2: List[int],
-    syre_std: float,
+    syre_stds: List[float],
     syre_offset_bases: List[int],
     advanced_removal: bool,
     d_bound: float,
@@ -349,7 +349,7 @@ def adamw_update_foreach_syre(
             Xs=list(X),
             gamma=gamma,
             seeds1=syre_seeds1,
-            std=syre_std,
+            std=syre_stds,
             seeds2=syre_seeds2,
             d_bound=d_bound,
             advanced_removal=advanced_removal,
@@ -375,14 +375,14 @@ def adamw_update_foreach_syre_async(
     cautious_wd: bool,
     syre_seeds1: List[int],
     syre_seeds2: List[int],
-    syre_std: float,
+    syre_stds: List[float],
     syre_offset_bases: List[int],
     advanced_removal: bool,
     d_bound: float,
 ) -> Generator[None, None, None]:
     adamw_update_foreach_syre(
         X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon,
-        cautious_wd, syre_seeds1, syre_seeds2, syre_std, syre_offset_bases,
+        cautious_wd, syre_seeds1, syre_seeds2, syre_stds, syre_offset_bases,
         advanced_removal, d_bound,
     )
     yield

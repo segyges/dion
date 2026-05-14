@@ -98,12 +98,104 @@ AR's signal-to-basic-SYRE ratio is ``d_bound ~ sigma_0``, which is
 why bf16's ~7-bit relative ulp swallows AR regardless of ``gamma``.
 """
 
-from typing import List, Optional
+import math
+from typing import Callable, List, Optional, Sequence, Union
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+
+# Per-tensor sigma_0 ("syre_std") preset resolvers. Each takes a parameter
+# tensor and returns the recommended sigma_0 for it, following Ziyin et al.
+# (2024) §5.4: "sigma_0 = 0.01/sqrt(d), where 1/d is the common initialization
+# variance" -- i.e. sigma_0 = 0.01 * (init std). The presets differ only in
+# which init scheme's std they use:
+#
+#   lecun_fan_in:   init std = 1/sqrt(fan_in)            (paper-strict; var=1/d)
+#   kaiming_fan_in: init std = sqrt(2/fan_in)            (He-normal, ReLU/GELU)
+#   xavier_normal:  init std = sqrt(2/(fan_in+fan_out))  (Glorot normal)
+#
+# Fan-in / fan-out follow PyTorch's nn.init conventions for ndim >= 2:
+#   fan_in  = prod(shape[1:])   (= shape[-1] for 2D, = in*k*k for conv)
+#   fan_out = shape[0]
+# ndim < 2 is rejected -- fan-in is undefined for scalars/vectors. Users who
+# want SYRE on bias / LayerNorm parameters should pass a callable instead
+# (e.g. ``lambda p: 0.01 * <known_init_std_for_p>``).
+def _fan_in_fan_out(p: Tensor) -> tuple:
+    if p.ndim < 2:
+        raise ValueError(
+            f"SYRE preset requires ndim >= 2 (got shape {tuple(p.shape)}). "
+            "Fan-in is undefined for scalars/vectors. Pass a callable to "
+            "syre_std_mode for full control, e.g. "
+            "syre_std_mode=lambda p: 0.01 * <your_init_std_for_p>."
+        )
+    fan_in = 1
+    for d in p.shape[1:]:
+        fan_in *= int(d)
+    fan_out = int(p.shape[0])
+    return fan_in, fan_out
+
+
+def _preset_lecun_fan_in(p: Tensor) -> float:
+    fan_in, _ = _fan_in_fan_out(p)
+    return 0.01 / math.sqrt(fan_in)
+
+
+def _preset_kaiming_fan_in(p: Tensor) -> float:
+    fan_in, _ = _fan_in_fan_out(p)
+    return 0.01 * math.sqrt(2.0 / fan_in)
+
+
+def _preset_xavier_normal(p: Tensor) -> float:
+    fan_in, fan_out = _fan_in_fan_out(p)
+    return 0.01 * math.sqrt(2.0 / (fan_in + fan_out))
+
+
+# Public name -> resolver mapping. Kept as a plain dict so callers can
+# enumerate the supported preset names (e.g. for error messages).
+SYRE_STD_PRESETS: dict = {
+    "lecun_fan_in": _preset_lecun_fan_in,
+    "kaiming_fan_in": _preset_kaiming_fan_in,
+    "xavier_normal": _preset_xavier_normal,
+}
+
+
+def resolve_syre_std(p: Tensor, mode: Union[str, Callable[[Tensor], float]]) -> float:
+    """Resolve a per-tensor sigma_0 from a ``syre_std_mode`` spec.
+
+    ``mode`` is either a preset name (string in :data:`SYRE_STD_PRESETS`)
+    or a callable taking the parameter and returning a positive float.
+    Validates that the resolved value is a finite positive float.
+    """
+    if isinstance(mode, str):
+        fn = SYRE_STD_PRESETS.get(mode)
+        if fn is None:
+            raise ValueError(
+                f"Unknown syre_std_mode preset: {mode!r}. "
+                f"Known presets: {sorted(SYRE_STD_PRESETS)}."
+            )
+    elif callable(mode):
+        fn = mode
+    else:
+        raise TypeError(
+            f"syre_std_mode must be a preset name (str) or a callable, "
+            f"got {type(mode).__name__}: {mode!r}"
+        )
+    value = fn(p)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"syre_std_mode resolver returned non-numeric "
+            f"{type(value).__name__}: {value!r}"
+        )
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"syre_std_mode resolver returned non-positive or non-finite "
+            f"value {value!r} for param of shape {tuple(p.shape)}"
+        )
+    return value
 
 
 # Storage-dtype dispatch for the multi-tensor kernel. Per-call all
@@ -249,9 +341,10 @@ def _syre_wd_multi_kernel(
     seeds1_ptr,           # *int32, length n_params
     seeds2_ptr,           # *int32, length n_params
     offset_bases_ptr,     # *int64, length n_params
+    stds_ptr,             # *fp32,  length n_params (per-param sigma_0)
     block_to_param_ptr,   # *int32, length total_blocks
     block_within_ptr,     # *int32, length total_blocks
-    gamma, std, d_bound,
+    gamma, d_bound,
     BLOCK_SIZE: tl.constexpr,
     ADVANCED_REMOVAL: tl.constexpr,
     CAUTIOUS: tl.constexpr,
@@ -264,12 +357,18 @@ def _syre_wd_multi_kernel(
     is a flat index over all blocks across all parameters; the lookup
     tables ``block_to_param`` / ``block_within`` decode it into a
     (param_idx, block_offset_within_param) pair, then per-param metadata
-    (raw X pointer, numel, seeds, offset_base) is loaded from the
+    (raw X pointer, numel, seeds, offset_base, std) is loaded from the
     indirection tables.
 
     Semantics are bit-identical to looping ``_syre_wd_kernel`` over each
     parameter individually. The fusion saves only launch overhead --
     each program does the same arithmetic.
+
+    The per-param ``std`` (sigma_0) lives in ``stds_ptr`` so that
+    different parameters can use different sigma_0 (e.g. paper-style
+    per-fan-in scaling) in a single launch. When the caller wants a
+    uniform sigma_0 the wrapper builds a constant table; the extra load
+    is one cache hit per block and below noise.
 
     X and U may have different dtypes (Aurora's post-orth path holds X
     in fp32 master and U in bf16-ish update form), but all X[i] share
@@ -284,6 +383,7 @@ def _syre_wd_multi_kernel(
     seed1 = tl.load(seeds1_ptr + param_idx)
     seed2 = tl.load(seeds2_ptr + param_idx)
     offset_base = tl.load(offset_bases_ptr + param_idx)
+    std = tl.load(stds_ptr + param_idx)
 
     offsets = block_within.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
@@ -317,7 +417,7 @@ def syre_wd_multi_inplace(
     Xs: List[Tensor],
     gamma: float,
     seeds1: List[int],
-    std: float,
+    std: Union[float, Sequence[float]],
     seeds2: List[int],
     d_bound: float,
     advanced_removal: bool,
@@ -328,14 +428,14 @@ def syre_wd_multi_inplace(
     Triton launch.
 
     Semantically equivalent to looping :func:`syre_wd_inplace` over each
-    ``(X, seed1, seed2, offset_base)`` (and ``U`` when cautious), but
-    pays per-launch overhead once instead of ``N`` times. Designed for
-    sharded clusters where per-rank shards are small and ``N`` launches
-    of ~18 us each dominate the SYRE step.
+    ``(X, seed1, seed2, offset_base, std)`` (and ``U`` when cautious),
+    but pays per-launch overhead once instead of ``N`` times. Designed
+    for sharded clusters where per-rank shards are small and ``N``
+    launches of ~18 us each dominate the SYRE step.
 
-    All inputs share ``gamma``, ``std``, ``d_bound``, ``advanced_removal``,
-    and ``cautious`` (set by ``Us is not None``). Per-param state lives
-    in the lists.
+    All inputs share ``gamma``, ``d_bound``, ``advanced_removal``, and
+    ``cautious`` (set by ``Us is not None``). Per-param state lives in
+    the lists.
 
     Args:
         Xs: parameter tensors (decayed in place). All must share device
@@ -345,7 +445,10 @@ def syre_wd_multi_inplace(
         gamma: scalar decay coefficient. ``0`` is a no-op (returns
             immediately).
         seeds1: per-param ``seed1`` (theta_0 PRNG seed).
-        std: scalar scale for ``theta_0`` (shared across all params).
+        std: scale for ``theta_0``. Either a single positive float (shared
+            across all params) or a per-param sequence of positive floats
+            matching ``len(Xs)``. The per-param form is how the
+            ``syre_std_mode`` preset/callable plumbs through.
         seeds2: per-param ``seed2`` (AR multiplier PRNG seed). Ignored
             unless ``advanced_removal=True``; any value works otherwise.
         d_bound: half-width of the AR uniform interval. Ignored unless
@@ -367,6 +470,25 @@ def syre_wd_multi_inplace(
     cautious = Us is not None
     if cautious:
         assert len(Us) == n_in, "Us length must match Xs"
+
+    # Normalize ``std`` to a per-param list. Scalars broadcast; sequences
+    # must match ``len(Xs)``. We accept anything indexable with ``len()``
+    # to keep call sites flexible (tuple, list, 1-D Python sequence).
+    if isinstance(std, (int, float)) and not isinstance(std, bool):
+        stds: List[float] = [float(std)] * n_in
+    else:
+        try:
+            n_std = len(std)  # type: ignore[arg-type]
+        except TypeError as e:
+            raise TypeError(
+                f"std must be a float or a sequence of floats, got "
+                f"{type(std).__name__}: {std!r}"
+            ) from e
+        if n_std != n_in:
+            raise ValueError(
+                f"std sequence length ({n_std}) must match len(Xs) ({n_in})"
+            )
+        stds = [float(s) for s in std]  # type: ignore[union-attr]
 
     device = Xs[0].device
     x_dtype = Xs[0].dtype
@@ -442,6 +564,7 @@ def syre_wd_multi_inplace(
         seeds1 = [seeds1[i] for i in keep]
         seeds2 = [seeds2[i] for i in keep]
         offset_bases = [offset_bases[i] for i in keep]
+        stds = [stds[i] for i in keep]
         if cautious:
             u_flats = [u_flats[i] for i in keep]
 
@@ -469,6 +592,7 @@ def syre_wd_multi_inplace(
     seeds1_t = torch.tensor(seeds1, dtype=torch.int32, device=device)
     seeds2_t = torch.tensor(seeds2, dtype=torch.int32, device=device)
     offset_bases_t = torch.tensor(offset_bases, dtype=torch.int64, device=device)
+    stds_t = torch.tensor(stds, dtype=torch.float32, device=device)
     blocks_per_param_t = torch.tensor(
         blocks_per_param, dtype=torch.int32, device=device,
     )
@@ -496,9 +620,9 @@ def syre_wd_multi_inplace(
     with torch.cuda.device(device):
         _syre_wd_multi_kernel[grid](
             x_addrs, u_addrs,
-            numels_t, seeds1_t, seeds2_t, offset_bases_t,
+            numels_t, seeds1_t, seeds2_t, offset_bases_t, stds_t,
             block_to_param_t, block_within_t,
-            gamma, std, d_bound,
+            gamma, d_bound,
             BLOCK_SIZE=BLOCK_SIZE,
             ADVANCED_REMOVAL=advanced_removal,
             CAUTIOUS=cautious,

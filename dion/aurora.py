@@ -22,7 +22,7 @@ from .scalar_opts import adamw_update_foreach_syre_async
 
 
 def _validate_syre_kwargs(
-    syre_wd, syre_std, advanced_removal, d_bound,
+    syre_wd, syre_std, advanced_removal, d_bound, syre_std_mode=None,
 ):
     """Strict validation for SYRE-related per-group kwargs.
 
@@ -37,6 +37,11 @@ def _validate_syre_kwargs(
     collapses ``D`` to the identity and defeats the entire purpose of
     advanced removal. Use ``advanced_removal=False`` if you don't want
     AR, or pick a positive ``d_bound``.
+
+    ``syre_std`` (scalar) and ``syre_std_mode`` (preset name or callable)
+    are mutually exclusive. When ``syre_wd=True``, exactly one must be
+    set. ``syre_std_mode`` resolves to a per-tensor sigma_0 at param-
+    registration time -- see :mod:`dion.syre` for the available presets.
     """
     if not isinstance(syre_wd, bool):
         raise TypeError(
@@ -66,23 +71,51 @@ def _validate_syre_kwargs(
             "0.1 * syre_std per Theorem 3's sigma_D = o(sigma_0) "
             "condition), or pass a positive d_bound."
         )
+
+    # syre_std vs syre_std_mode: mutually exclusive, exactly one required
+    # when SYRE is on. Validate types/values for whichever side is set.
     if syre_wd:
-        if syre_std is None:
+        if syre_std is not None and syre_std_mode is not None:
             raise ValueError(
-                "syre_wd=True requires an explicit syre_std (positive float). "
-                "There is intentionally no empirical default; if you want to "
-                "scale by the param's init magnitude, compute it explicitly "
-                "and pass syre_std=<your_value>."
+                "syre_std and syre_std_mode are mutually exclusive. Pass "
+                "syre_std=<float> for a single uniform sigma_0, OR "
+                "syre_std_mode=<preset_name_or_callable> for per-tensor "
+                "scaling -- not both."
             )
-        if isinstance(syre_std, bool) or not isinstance(syre_std, (int, float)):
-            raise TypeError(
-                f"syre_std must be a positive float, got "
-                f"{type(syre_std).__name__}: {syre_std!r}"
-            )
-        if float(syre_std) <= 0.0:
+        if syre_std is None and syre_std_mode is None:
+            from .syre import SYRE_STD_PRESETS
             raise ValueError(
-                f"syre_std must be a positive float, got {syre_std}"
+                "syre_wd=True requires either syre_std (positive float) or "
+                "syre_std_mode (preset name or callable). There is "
+                "intentionally no empirical default. Presets available: "
+                f"{sorted(SYRE_STD_PRESETS)}. Or pass a callable like "
+                "lambda p: 0.01 * <your_init_std_for_p>."
             )
+        if syre_std is not None:
+            if isinstance(syre_std, bool) or not isinstance(syre_std, (int, float)):
+                raise TypeError(
+                    f"syre_std must be a positive float, got "
+                    f"{type(syre_std).__name__}: {syre_std!r}"
+                )
+            if float(syre_std) <= 0.0:
+                raise ValueError(
+                    f"syre_std must be a positive float, got {syre_std}"
+                )
+        if syre_std_mode is not None:
+            if isinstance(syre_std_mode, str):
+                from .syre import SYRE_STD_PRESETS
+                if syre_std_mode not in SYRE_STD_PRESETS:
+                    raise ValueError(
+                        f"Unknown syre_std_mode preset: {syre_std_mode!r}. "
+                        f"Known presets: {sorted(SYRE_STD_PRESETS)}."
+                    )
+            elif not callable(syre_std_mode):
+                raise TypeError(
+                    f"syre_std_mode must be a preset name (str) or a "
+                    f"callable taking a Tensor and returning a positive "
+                    f"float, got {type(syre_std_mode).__name__}: "
+                    f"{syre_std_mode!r}"
+                )
 
 
 # Smallest ``d_bound`` we let through when SYRE-AR is on. The SYRE
@@ -119,6 +152,14 @@ def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
     SYRE and AR are on; otherwise pass through unchanged. Also rejects
     a resolved ``d_bound`` so small that AR has no measurable effect.
 
+    Note: when the group uses ``syre_std_mode`` (per-tensor sigma_0)
+    instead of a scalar ``syre_std``, this function is called with
+    ``syre_std=None``; the auto-resolution and per-param Theorem-3 /
+    AR-floor checks are deferred to :func:`_check_syre_per_param_sigma0`,
+    invoked at step time once per-param sigma_0 is known. The d_bound
+    range check (``[0, 1)``, plus the explicit-zero-with-AR refusal)
+    still runs through ``_validate_syre_kwargs``.
+
     The paper (Ziyin et al., 2024) only proves AR's symmetry-removal
     strength under ``sigma_D = o(sigma_0)`` (Theorem 3). For
     ``D_ii ~ Uniform(1 - d_bound, 1 + d_bound)``, ``sigma_D = d_bound /
@@ -144,7 +185,12 @@ def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
     Must be called *after* ``_validate_syre_kwargs`` so we can rely on
     ``syre_std`` being a positive float when SYRE is on.
     """
-    if syre_wd and advanced_removal and d_bound is None:
+    if (
+        syre_wd
+        and advanced_removal
+        and d_bound is None
+        and syre_std is not None
+    ):
         d_bound = 0.1 * float(syre_std)
     if (
         syre_wd
@@ -188,6 +234,44 @@ def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
             stacklevel=3,
         )
     return d_bound
+
+
+def _check_syre_per_param_sigma0(
+    sigma0_list, advanced_removal, d_bound,
+):
+    """Per-param Theorem-3 + AR-floor check for ``syre_std_mode`` groups.
+
+    Scalar-``syre_std`` groups handle both checks at construction time
+    in :func:`_resolve_syre_d_bound`. When the group uses
+    ``syre_std_mode``, sigma_0 is only known per-param at step time, so
+    we defer both checks here. Fires at most once per ``(group, kind)``
+    pair (callers cache after first invocation via the ``_checked`` flag
+    on the optimizer state) so warnings/errors don't repeat every step.
+
+    Uses ``min(sigma0_list)`` as the worst case for the Theorem-3 ratio
+    -- if any param's sigma_0 is small enough to violate sigma_D <
+    sigma_0, AR is outside the proved regime for at least that param.
+    The AR-floor check is over min sigma_0 only when d_bound auto-
+    resolves; with the user-set d_bound path, only d_bound matters
+    (handled in ``_resolve_syre_d_bound``).
+    """
+    if not sigma0_list or not advanced_removal or d_bound is None:
+        return
+    sigma_d = float(d_bound) / math.sqrt(3.0)
+    sigma0_min = min(sigma0_list)
+    if sigma_d >= sigma0_min:
+        warnings.warn(
+            f"SYRE-AR: sigma_D ({sigma_d:.3g}) >= min per-param sigma_0 "
+            f"({sigma0_min:.3g}); Theorem 3 of Ziyin et al. (2024) only "
+            "guarantees AR's symmetry-removal strength when sigma_D = "
+            "o(sigma_0). For per-tensor syre_std_mode this is checked "
+            "against the smallest resolved sigma_0 across the group. "
+            "Pass a smaller d_bound (e.g. <= 0.5 * smallest_sigma_0) or "
+            "switch to a preset that gives larger sigma_0 to stay in "
+            "the proved regime.",
+            SyreTheorem3Warning,
+            stacklevel=3,
+        )
 
 
 def _check_syre_triton_available():
@@ -266,9 +350,21 @@ class Aurora(DistributedOrthoBase):
             uses the update direction ``M_new / (sqrt(V_new/bc2) + eps)``,
             matching segyges/aurora. ``algorithm="lion"`` + ``syre_wd=True``
             is refused (not wired).
-        syre_std: Required when ``syre_wd=True``. Scale of ``theta_0``. No
-            empirical default -- if you want to couple this to your init
-            magnitude, compute and pass it explicitly.
+        syre_std: Scale of ``theta_0`` (a single positive float, shared
+            across all params in the group). Mutually exclusive with
+            ``syre_std_mode``. Exactly one of the two must be set when
+            ``syre_wd=True``. No empirical default -- if you want to
+            couple this to your init magnitude, compute and pass it
+            explicitly, or use ``syre_std_mode``.
+        syre_std_mode: Per-tensor sigma_0 specification. Either a preset
+            name (one of ``"lecun_fan_in"``, ``"kaiming_fan_in"``,
+            ``"xavier_normal"``) or a callable ``(p: Tensor) -> float``.
+            Resolved per-tensor at param-registration time and cached in
+            the optimizer state. Presets follow Ziyin et al. (2024)
+            §5.4: ``sigma_0 = 0.01 * (init_std_for_p)``, with each
+            preset using a different init scheme's std. Presets require
+            ``ndim >= 2``; for ``ndim < 2`` (e.g. AdamW bias/LN groups)
+            pass a callable. Mutually exclusive with ``syre_std``.
         advanced_removal: SYRE-AR variant. Multiplies the SYRE diff by a per-
             element ``Uniform(1 - d_bound, 1 + d_bound)`` factor before the
             decay step, breaking continuous symmetries the basic form leaves
@@ -306,6 +402,7 @@ class Aurora(DistributedOrthoBase):
         pp_beta: float = 0.5,
         syre_wd: bool = False,
         syre_std: Optional[float] = None,
+        syre_std_mode: Optional[Union[str, Callable[[Tensor], float]]] = None,
         advanced_removal: bool = False,
         d_bound: Optional[float] = None,
         use_gram_newton_schulz: bool = False,
@@ -330,7 +427,10 @@ class Aurora(DistributedOrthoBase):
             )
         if pp_beta < 0.0:
             raise ValueError(f"Invalid pp_beta: {pp_beta}")
-        _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+        _validate_syre_kwargs(
+            syre_wd, syre_std, advanced_removal, d_bound,
+            syre_std_mode=syre_std_mode,
+        )
         d_bound = _resolve_syre_d_bound(
             syre_wd, syre_std, advanced_removal, d_bound,
         )
@@ -359,6 +459,7 @@ class Aurora(DistributedOrthoBase):
             pp_beta=pp_beta,
             syre_wd=syre_wd,
             syre_std=syre_std,
+            syre_std_mode=syre_std_mode,
             advanced_removal=advanced_removal,
             d_bound=d_bound,
         )
@@ -397,6 +498,9 @@ class Aurora(DistributedOrthoBase):
         """
         syre_wd = param_group.get("syre_wd", self.defaults["syre_wd"])
         syre_std = param_group.get("syre_std", self.defaults["syre_std"])
+        syre_std_mode = param_group.get(
+            "syre_std_mode", self.defaults["syre_std_mode"]
+        )
         advanced_removal = param_group.get(
             "advanced_removal", self.defaults["advanced_removal"]
         )
@@ -407,13 +511,20 @@ class Aurora(DistributedOrthoBase):
             param_group["d_bound"] if "d_bound" in param_group
             else self.defaults["d_bound"]
         )
-        _validate_syre_kwargs(syre_wd, syre_std, advanced_removal, d_bound)
+        _validate_syre_kwargs(
+            syre_wd, syre_std, advanced_removal, d_bound,
+            syre_std_mode=syre_std_mode,
+        )
         d_bound = _resolve_syre_d_bound(
             syre_wd, syre_std, advanced_removal, d_bound,
         )
         # Write the resolved value back so the group dict the base class
         # ends up storing has the auto-resolved float, not ``None``.
         param_group["d_bound"] = d_bound
+        # Ensure the new group dict carries ``syre_std_mode`` even if the
+        # caller didn't set it -- this keeps ``group.get("syre_std_mode")``
+        # at step time consistent with construction-time groups.
+        param_group["syre_std_mode"] = syre_std_mode
 
         algorithm = param_group.get("algorithm", self.defaults["algorithm"])
         if syre_wd and algorithm == "lion":
@@ -424,6 +535,45 @@ class Aurora(DistributedOrthoBase):
         if syre_wd:
             _check_syre_triton_available()
         super().add_param_group(param_group)
+
+    def _get_or_init_syre_std(
+        self,
+        p: Tensor,
+        syre_std: Optional[float],
+        syre_std_mode: Optional[Union[str, Callable[[Tensor], float]]],
+    ) -> float:
+        """Lazily resolve and cache the per-param sigma_0 for SYRE.
+
+        When the group uses scalar ``syre_std``, the result is just that
+        float (still cached so the step-time hot path doesn't recompute
+        ``float(group["syre_std"])`` on every iteration). When the group
+        uses ``syre_std_mode``, the preset / callable is invoked once
+        per param and the result cached -- so callables that read
+        e.g. ``torch.nn.init`` metadata aren't paying that cost every
+        step.
+
+        Cache lives at ``self.state[p]["syre_std"]`` and round-trips
+        through ``state_dict``, so resume reproduces the exact same
+        per-param sigma_0 sequence even if the user changes the preset
+        between runs (the cached value wins). To force re-resolution
+        after a config change, delete ``state[p]["syre_std"]``.
+        """
+        s = self.state[p]
+        if "syre_std" not in s:
+            if syre_std_mode is not None:
+                from .syre import resolve_syre_std
+                value = resolve_syre_std(p, syre_std_mode)
+            elif syre_std is not None:
+                value = float(syre_std)
+            else:
+                # Validation has already rejected this combo; defensive.
+                raise RuntimeError(
+                    "SYRE state init: neither syre_std nor syre_std_mode "
+                    "is set. This is a bug -- _validate_syre_kwargs "
+                    "should have refused this group earlier."
+                )
+            s["syre_std"] = float(value)
+        return float(s["syre_std"])
 
     def _get_or_init_syre_seeds(
         self, p: Tensor, advanced_removal: bool,
@@ -509,7 +659,8 @@ class Aurora(DistributedOrthoBase):
             # kernel won't read it in that branch anyway.
             d_bound_raw = group["d_bound"]
             d_bound = float(d_bound_raw) if d_bound_raw is not None else 0.0
-            syre_std = float(group["syre_std"]) if syre_wd else 0.0
+            syre_std_scalar = group["syre_std"]
+            syre_std_mode = group.get("syre_std_mode")
 
             update_args = dict(
                 lr=torch.tensor(group["lr"]),
@@ -530,7 +681,6 @@ class Aurora(DistributedOrthoBase):
                 ),
                 cautious_wd=group["cautious_wd"],
                 syre_wd=syre_wd,
-                syre_std=syre_std,
                 advanced_removal=advanced_removal,
                 d_bound=d_bound,
             )
@@ -580,6 +730,7 @@ class Aurora(DistributedOrthoBase):
                     syre_seeds1: List[int] = []
                     syre_seeds2: List[int] = []
                     syre_offset_bases: List[int] = []
+                    syre_stds: List[float] = []
                     for p in original_params:
                         s1, s2 = self._get_or_init_syre_seeds(
                             p, advanced_removal
@@ -589,10 +740,30 @@ class Aurora(DistributedOrthoBase):
                         syre_offset_bases.append(
                             self._compute_syre_offset_base(p)
                         )
+                        syre_stds.append(
+                            self._get_or_init_syre_std(
+                                p, syre_std_scalar, syre_std_mode,
+                            )
+                        )
+                    # When ``syre_std_mode`` is in use, the per-param
+                    # sigma_0 set is only known once params are seen; fire
+                    # the Theorem-3 / AR-floor warning at most once per
+                    # group via a flag on the group dict so we don't
+                    # re-check every step.
+                    if (
+                        syre_std_mode is not None
+                        and not group.get("_syre_sigma0_checked", False)
+                    ):
+                        _check_syre_per_param_sigma0(
+                            syre_stds, advanced_removal,
+                            group["d_bound"],
+                        )
+                        group["_syre_sigma0_checked"] = True
                 else:
                     syre_seeds1 = None
                     syre_seeds2 = None
                     syre_offset_bases = None
+                    syre_stds = None
 
                 yield AsyncTask(
                     aurora_update_megabatch_async(
@@ -603,6 +774,7 @@ class Aurora(DistributedOrthoBase):
                         syre_seeds1=syre_seeds1,
                         syre_seeds2=syre_seeds2,
                         syre_offset_bases=syre_offset_bases,
+                        syre_stds=syre_stds,
                         **megabatch_args,
                     )
                 )
@@ -642,16 +814,31 @@ class Aurora(DistributedOrthoBase):
             # branch in that case.
             d_bound_raw = group["d_bound"]
             d_bound = float(d_bound_raw) if d_bound_raw is not None else 0.0
-            syre_std = float(group["syre_std"])
+            syre_std_scalar = group["syre_std"]
+            syre_std_mode = group.get("syre_std_mode")
 
             syre_seeds1: List[int] = []
             syre_seeds2: List[int] = []
             syre_offset_bases: List[int] = []
+            syre_stds: List[float] = []
             for p in params:
                 s1, s2 = self._get_or_init_syre_seeds(p, advanced_removal)
                 syre_seeds1.append(s1)
                 syre_seeds2.append(s2)
                 syre_offset_bases.append(self._compute_syre_offset_base(p))
+                syre_stds.append(
+                    self._get_or_init_syre_std(
+                        p, syre_std_scalar, syre_std_mode,
+                    )
+                )
+            if (
+                syre_std_mode is not None
+                and not group.get("_syre_sigma0_checked", False)
+            ):
+                _check_syre_per_param_sigma0(
+                    syre_stds, advanced_removal, group["d_bound"],
+                )
+                group["_syre_sigma0_checked"] = True
 
             yield AsyncTask(
                 adamw_update_foreach_syre_async(
@@ -668,7 +855,7 @@ class Aurora(DistributedOrthoBase):
                     cautious_wd=group.get("cautious_wd", False),
                     syre_seeds1=syre_seeds1,
                     syre_seeds2=syre_seeds2,
-                    syre_std=syre_std,
+                    syre_stds=syre_stds,
                     syre_offset_bases=syre_offset_bases,
                     advanced_removal=advanced_removal,
                     d_bound=d_bound,
@@ -712,12 +899,12 @@ def aurora_update_megabatch_async(
     newton_schulz_func: Optional[Callable] = None,
     cautious_wd: bool = False,
     syre_wd: bool = False,
-    syre_std: float = 0.0,
     advanced_removal: bool = False,
     d_bound: float = 0.01,
     syre_seeds1: Optional[List[int]] = None,
     syre_seeds2: Optional[List[int]] = None,
     syre_offset_bases: Optional[List[int]] = None,
+    syre_stds: Optional[List[float]] = None,
 ) -> Generator[None, None, None]:
     """
     Mega-batched Aurora update. Reuses Muon's pre/post-orthogonalize stages
@@ -784,7 +971,7 @@ def aurora_update_megabatch_async(
             cautious_wd=cautious_wd,
             syre_seeds1=syre_seeds1,
             syre_seeds2=syre_seeds2,
-            syre_std=syre_std,
+            syre_stds=syre_stds,
             syre_offset_bases=syre_offset_bases,
             advanced_removal=advanced_removal,
             d_bound=d_bound,
@@ -809,7 +996,7 @@ def aurora_update_post_orthogonalize(
     cautious_wd: bool,
     syre_seeds1: List[int],
     syre_seeds2: List[int],
-    syre_std: float,
+    syre_stds: List[float],
     syre_offset_bases: List[int],
     advanced_removal: bool,
     d_bound: float,
@@ -846,7 +1033,7 @@ def aurora_update_post_orthogonalize(
             Xs=list(X),
             gamma=gamma,
             seeds1=syre_seeds1,
-            std=syre_std,
+            std=syre_stds,
             seeds2=syre_seeds2,
             d_bound=d_bound,
             advanced_removal=advanced_removal,

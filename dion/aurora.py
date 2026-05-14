@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import torch
 from collections import defaultdict
@@ -98,6 +99,21 @@ def _validate_syre_kwargs(
 _SYRE_AR_D_BOUND_FP32_FLOOR = 1e-6
 
 
+class SyreTheorem3Warning(UserWarning):
+    """``sigma_D = d_bound / sqrt(3)`` is not ``o(sigma_0)``.
+
+    Theorem 3 of Ziyin et al. (2024) only proves SYRE-AR's symmetry-
+    removal strength when ``sigma_D = o(sigma_0)``. The default
+    ``d_bound = 0.1 * syre_std`` (auto-resolved) gives
+    ``sigma_D/sigma_0 ~ 0.058``, comfortably perturbative. A user-passed
+    ``d_bound`` large enough that ``sigma_D >= sigma_0`` puts AR outside
+    that regime: basic SYRE still works, but AR's theoretical guarantee
+    no longer applies and AR may dominate the symmetric pull from
+    ``theta_0``. We warn rather than error because some users may
+    deliberately want this regime for exploration.
+    """
+
+
 def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
     """Auto-resolve ``d_bound=None`` to ``0.1 * syre_std`` when both
     SYRE and AR are on; otherwise pass through unchanged. Also rejects
@@ -147,6 +163,29 @@ def _resolve_syre_d_bound(syre_wd, syre_std, advanced_removal, d_bound):
             "is too small -- the paper recommends "
             "syre_std = 0.01 / sqrt(d). Otherwise pass an explicit "
             "d_bound >= 1e-6."
+        )
+    # Theorem-3-precondition soft check. ``sigma_D = d_bound / sqrt(3)``;
+    # auto-resolved ``d_bound = 0.1 * syre_std`` gives ``sigma_D/sigma_0
+    # ~ 0.058`` and never trips this. A user-passed combo that does is
+    # warned but not refused -- AR may still help empirically, the paper
+    # just doesn't prove it in that regime.
+    if (
+        syre_wd
+        and advanced_removal
+        and d_bound is not None
+        and syre_std is not None
+        and float(d_bound) / math.sqrt(3.0) >= float(syre_std)
+    ):
+        sigma_d = float(d_bound) / math.sqrt(3.0)
+        warnings.warn(
+            f"SYRE-AR: sigma_D ({sigma_d:.3g}) >= sigma_0 ({float(syre_std):.3g}); "
+            "Theorem 3 of Ziyin et al. (2024) only guarantees AR's "
+            "symmetry-removal strength when sigma_D = o(sigma_0). Default "
+            "auto-resolution (d_bound=None) gives sigma_D/sigma_0 ~ 0.058. "
+            "Pass d_bound smaller (e.g. <= 0.5 * syre_std) or omit it to "
+            "stay in the proved regime.",
+            SyreTheorem3Warning,
+            stacklevel=3,
         )
     return d_bound
 
@@ -798,18 +837,26 @@ def aurora_update_post_orthogonalize(
     gamma = float(base_lr) * float(weight_decay)
     adj_lr_f = float(adjusted_lr)
 
-    for i, (x, u) in enumerate(zip(X, U)):
-        syre_wd_inplace(
-            x,
-            gamma=gamma,
-            seed1=syre_seeds1[i],
-            std=syre_std,
-            seed2=syre_seeds2[i],
-            d_bound=d_bound,
-            advanced_removal=advanced_removal,
-            offset_base=syre_offset_bases[i],
-            U=u if cautious_wd else None,
-        )
+    # Skip the per-param SYRE launch entirely when gamma == 0 (e.g.
+    # weight_decay=0). ``syre_wd_inplace`` early-returns internally,
+    # but the per-param Python overhead is still measurable for groups
+    # with many small params. Mirrors the guard in
+    # ``scalar_opts.adamw_update_foreach_syre``.
+    if gamma > 0.0:
+        for i, (x, u) in enumerate(zip(X, U)):
+            syre_wd_inplace(
+                x,
+                gamma=gamma,
+                seed1=syre_seeds1[i],
+                std=syre_std,
+                seed2=syre_seeds2[i],
+                d_bound=d_bound,
+                advanced_removal=advanced_removal,
+                offset_base=syre_offset_bases[i],
+                U=u if cautious_wd else None,
+            )
+
+    for x, u in zip(X, U):
         x.sub_(u, alpha=adj_lr_f)
 
 

@@ -108,9 +108,20 @@ from torch import Tensor
 
 @triton.jit
 def _syre_wd_kernel(
-    X_ptr, numel, gamma, seed1, std, seed2, d_bound, offset_base,
-    BLOCK_SIZE: tl.constexpr, ADVANCED_REMOVAL: tl.constexpr,
+    X_ptr, U_ptr, numel, gamma, seed1, std, seed2, d_bound, offset_base,
+    BLOCK_SIZE: tl.constexpr,
+    ADVANCED_REMOVAL: tl.constexpr,
+    CAUTIOUS: tl.constexpr,
 ):
+    """SYRE WD step (all four variants).
+
+    Variants are selected by the ``ADVANCED_REMOVAL`` and ``CAUTIOUS``
+    ``tl.constexpr`` flags; the compiler specializes per (flag, flag)
+    combination at JIT time, so dead branches cost nothing at runtime
+    and ``U_ptr`` is dereferenced *only* when ``CAUTIOUS=True``. Pass
+    any valid pointer (e.g. ``X_ptr`` itself) for ``U_ptr`` in the
+    non-cautious case; the load is dead-code-eliminated.
+    """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
@@ -133,35 +144,11 @@ def _syre_wd_kernel(
         xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
         diff = diff + diff * xi
 
+    if CAUTIOUS:
+        u_f32 = tl.load(U_ptr + offsets, mask=mask).to(tl.float32)
+        diff = tl.where(u_f32 * theta_f32 >= 0.0, diff, 0.0)
+
     result = theta_f32 - gamma * diff
-    tl.store(X_ptr + offsets, result.to(theta.dtype), mask=mask)
-
-
-@triton.jit
-def _syre_wd_cautious_kernel(
-    X_ptr, U_ptr, numel, gamma, seed1, std, seed2, d_bound, offset_base,
-    BLOCK_SIZE: tl.constexpr, ADVANCED_REMOVAL: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel
-
-    theta = tl.load(X_ptr + offsets, mask=mask)
-    u = tl.load(U_ptr + offsets, mask=mask)
-    theta_f32 = theta.to(tl.float32)
-    u_f32 = u.to(tl.float32)
-
-    global_offsets = offsets + offset_base
-    theta_0 = tl.randn(seed1, global_offsets) * std
-    diff = theta_f32 - theta_0
-
-    if ADVANCED_REMOVAL:
-        # See additive-form note in _syre_wd_kernel above.
-        xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
-        diff = diff + diff * xi
-
-    cautious_mask = tl.where(u_f32 * theta_f32 >= 0.0, 1.0, 0.0)
-    result = theta_f32 - gamma * diff * cautious_mask
     tl.store(X_ptr + offsets, result.to(theta.dtype), mask=mask)
 
 
@@ -225,24 +212,20 @@ def syre_wd_inplace(
         X_contig = X
     X_flat = X_contig.view(-1)
 
+    cautious = U is not None
+    # ``reshape(-1)`` safely flattens a possibly-non-contiguous U (copies
+    # if needed). When U is None we pass X_flat as a dummy pointer; the
+    # ``CAUTIOUS=False`` constexpr branch never dereferences it.
+    U_flat = U.reshape(-1) if cautious else X_flat
+
     with torch.cuda.device(X.device):
-        if U is not None:
-            # ``reshape(-1)`` safely flattens a possibly-non-contiguous
-            # U (copies if needed).
-            U_flat = U.reshape(-1)
-            _syre_wd_cautious_kernel[grid](
-                X_flat, U_flat, numel,
-                gamma, seed1, std, seed2, d_bound, offset_base,
-                BLOCK_SIZE=BLOCK_SIZE,
-                ADVANCED_REMOVAL=advanced_removal,
-            )
-        else:
-            _syre_wd_kernel[grid](
-                X_flat, numel,
-                gamma, seed1, std, seed2, d_bound, offset_base,
-                BLOCK_SIZE=BLOCK_SIZE,
-                ADVANCED_REMOVAL=advanced_removal,
-            )
+        _syre_wd_kernel[grid](
+            X_flat, U_flat, numel,
+            gamma, seed1, std, seed2, d_bound, offset_base,
+            BLOCK_SIZE=BLOCK_SIZE,
+            ADVANCED_REMOVAL=advanced_removal,
+            CAUTIOUS=cautious,
+        )
 
     if needs_copy_back:
         X.copy_(X_contig)

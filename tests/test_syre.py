@@ -26,7 +26,7 @@ import importlib.util
 import pytest
 import torch
 
-from dion.aurora import Aurora
+from dion.aurora import Aurora, SyreTheorem3Warning
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -283,6 +283,74 @@ def test_add_param_group_d_bound_below_fp32_floor_raises():
             "params": [p2],
             "syre_wd": True, "syre_std": 0.02,
             "advanced_removal": True, "d_bound": 1e-8,
+        })
+
+
+def test_d_bound_above_theorem3_warns():
+    """``sigma_D >= sigma_0`` puts AR outside the regime where Theorem 3
+    proves symmetry-removal strength. We warn (not raise) because users
+    may want to explore this empirically.
+    """
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    # syre_std = 0.01 -> sigma_0 = 0.01.
+    # d_bound = 0.05 -> sigma_D = 0.05 / sqrt(3) ~ 0.0289 > sigma_0.
+    with pytest.warns(SyreTheorem3Warning, match="sigma_D"):
+        Aurora(
+            [p], syre_wd=True, syre_std=0.01,
+            advanced_removal=True, d_bound=0.05,
+        )
+
+
+def test_d_bound_below_theorem3_does_not_warn():
+    """The auto-resolved ``d_bound = 0.1 * syre_std`` and reasonable
+    user-passed values must not trip the Theorem-3 warning.
+    """
+    import warnings as _warnings
+
+    p1 = torch.nn.Parameter(torch.randn(8, 4))
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", SyreTheorem3Warning)
+        # Auto-resolved: d_bound = 1e-3 -> sigma_D ~ 5.77e-4 << 1e-2 = sigma_0.
+        Aurora([p1], syre_wd=True, syre_std=0.01, advanced_removal=True)
+
+    p2 = torch.nn.Parameter(torch.randn(8, 4))
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", SyreTheorem3Warning)
+        # Explicit but comfortably perturbative.
+        Aurora(
+            [p2], syre_wd=True, syre_std=0.01,
+            advanced_removal=True, d_bound=5e-3,
+        )
+
+
+def test_d_bound_theorem3_warning_off_when_ar_disabled():
+    """The Theorem-3 condition only matters when AR is on. With
+    ``advanced_removal=False`` ``d_bound`` is unused by the kernel, so
+    even a comically large value must not warn.
+    """
+    import warnings as _warnings
+
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", SyreTheorem3Warning)
+        Aurora(
+            [p], syre_wd=True, syre_std=0.01,
+            advanced_removal=False, d_bound=0.5,
+        )
+
+
+def test_add_param_group_d_bound_theorem3_warns():
+    """The Theorem-3 warning must fire at ``add_param_group`` time too,
+    not just at construction.
+    """
+    p1 = torch.nn.Parameter(torch.randn(8, 4))
+    p2 = torch.nn.Parameter(torch.randn(4, 4))
+    opt = Aurora([p1])
+    with pytest.warns(SyreTheorem3Warning, match="sigma_D"):
+        opt.add_param_group({
+            "params": [p2],
+            "syre_wd": True, "syre_std": 0.01,
+            "advanced_removal": True, "d_bound": 0.05,
         })
 
 

@@ -1,101 +1,39 @@
-"""SYRE weight decay (Ziyin et al., ICLR 2025).
+"""SYRE weight decay (Ziyin et al., 2024; arXiv:2408.15495).
 
-Per-tensor SYRE / SYRE-AR weight decay, with an optional cautious mask.
-Triton-backed; this module imports ``triton`` at module scope and will
-raise ``ImportError`` on import in environments without it. Callers in
-:mod:`dion.aurora` gate the import so users without triton can still
-construct optimizers that do not request SYRE.
+Triton-backed SYRE / SYRE-AR weight decay with an optional cautious
+mask. Imports ``triton`` at module scope and will raise ``ImportError``
+on import in environments without it; callers in :mod:`dion.aurora`
+gate the import so users who don't request SYRE never trigger it.
 
-Math:
+In one line: ``theta <- theta - gamma * (theta - theta_0)`` where
+``theta_0`` is regenerated from a stored per-parameter PRNG seed each
+step (no memory overhead). The decay coefficient ``gamma`` is computed
+by the caller; Aurora's contract is ``gamma = lr * weight_decay``. AR
+adds a per-element ``Uniform(1 - d_bound, 1 + d_bound)`` multiplier on
+the SYRE diff; cautious-SYRE gates the diff by the update direction
+sign. See :func:`syre_wd_inplace` and the paper (Theorem 3 and §5.4)
+for the full math.
 
-* **Basic SYRE.** ``theta <- theta - gamma * (theta - theta_0)`` where
-  ``theta_0 = randn(seed1, global_offset) * std`` is regenerated from a
-  stored per-parameter PRNG seed each step (no memory overhead for the
-  target). The pull is element-wise; correctness on sharded params
-  requires every element across the cluster to receive a unique global
-  Philox offset, which the caller arranges via ``offset_base``.
-* **SYRE-AR (advanced removal).** Multiplies ``(theta - theta_0)`` by
-  ``d ~ Uniform(1 - d_bound, 1 + d_bound)`` (per element, keyed by
-  ``seed2``) before the decay step. Breaks the continuous symmetries
-  that basic SYRE / L2 cannot resolve, by giving each coordinate a
-  slightly different decay coefficient. Implementation note:
-  computed in *additive form* as ``diff + diff*xi`` with
-  ``xi = d - 1 ~ Uniform(-d_bound, +d_bound)``, never materializing
-  ``(1 + xi)`` in fp32. See "Pigeonhole avoidance" below.
-* **Cautious SYRE.** Gates the SYRE diff element-wise by the
-  cautious-WD mask ``(u * theta >= 0)``, where ``u`` is the post-orth
-  update tensor that the optimizer is about to subtract from ``theta``
-  (modulo ``lr``). The mask uses the *update direction*, not
-  ``(theta - theta_0)``; this is "cautious WD applied to SYRE",
-  matching the cautious-WD form already shipped in
-  :func:`dion.muon.muon_update_post_orthogonalize`. SYRE-AR composes by
-  multiplying the diff by ``d`` *before* masking.
+This module also owns the per-tensor sigma_0 presets used by Aurora's
+``syre_std_mode`` kwarg (:data:`SYRE_STD_PRESETS`,
+:func:`resolve_syre_std`).
 
-The decay coefficient ``gamma`` is computed by the caller. Aurora's
-contract is ``gamma = lr * weight_decay``.
+Implementation details worth surfacing:
 
-Pigeonhole avoidance (additive form)
-------------------------------------
-
-The paper requires ``D_ii`` (i.e. ``1 + xi_i``) all distinct. A naive
-implementation forms ``d = 1 + xi`` in fp32 and multiplies
-``diff * d``. fp32 ulp at 1.0 is ~1.2e-7, so the window of
-representable ``(1 + xi)`` values has only ``2*d_bound / 1.2e-7``
-distinct fp32 levels -- a few hundred at typical ``d_bound`` ~ 3e-5,
-far fewer than the millions of elements in a real layer. By
-pigeonhole this produces massive collisions, and ~half the elements
-get ``d`` rounded to *exactly* 1.0 (giving them zero AR contribution
-per step, not merely sub-ulp).
-
-We instead compute the algebraically-identical ``diff * (1 + xi)``
-as ``diff + diff * xi``, never forming ``(1 + xi)``:
-
-* ``xi`` lives in ``[-d_bound, +d_bound]`` near 0. fp32 ulp near
-  ``d_bound ~ 3e-5`` is ~1.2e-12, so the window admits ~5e7 distinct
-  fp32 values -- enough to keep ``xi_i`` distinct per element well
-  past typical layer sizes.
-* ``diff * xi`` is a multiplication, which preserves the relative
-  precision of ``xi`` (rounding happens at the product's magnitude,
-  not near 1.0).
-* ``diff + diff*xi``: ``diff*xi`` is added at ``diff``'s magnitude,
-  where ulp is much smaller than ulp(1.0). The contribution survives.
-
-The mathematical distribution of the implicit ``D`` matrix is
-identical to the naive form; the rearrangement only changes which
-intermediate values the fp32 representation has to store.
-
-Storage-dtype precision
------------------------
-
-The kernel does all arithmetic in fp32 (``theta_f32 = theta.to(fp32)``)
-but writes the result back to the parameter's storage dtype. The
-storage dtype -- *not* the gradient dtype, autocast context, or
-anything else upstream -- is what determines whether SYRE's per-step
-contribution survives.
-
-Rough order-of-magnitude (with ``lr=3e-4``, ``wd=0.1``,
-``sigma_0 = 0.01/sqrt(d)``, weight magnitude ``~0.03``):
-
-* **fp32 storage** (incl. fp32-master / bf16-grad mixed precision):
-  basic SYRE contributes ~250 fp32-ulps per step, AR contributes
-  ~8e-3 fp32-ulps per step. Basic SYRE registers cleanly; AR is
-  sub-ulp per step but accumulates deterministically (the per-element
-  AR multiplier is fixed by Philox seed, not redrawn step-to-step),
-  reaching ~80 ulps over one WD half-life. **Both behave as the paper
-  intends.**
-
-* **bf16 storage** (pure-bf16 training, 8-bit optimizers holding
-  bf16 params): basic SYRE contributes ~4e-3 bf16-ulps per step --
-  still accumulates over long horizons under round-to-nearest-even,
-  but at heavily attenuated effective ``gamma``. AR contributes
-  ~1e-7 bf16-ulps per step and **never crosses 1 ulp at realistic
-  step counts** -- it is effectively a no-op. If you need SYRE/AR to
-  behave as documented, use fp32 master weights or stochastic
-  rounding on the writeback.
-
-Numbers scale predictably with layer init magnitude and ``gamma``;
-AR's signal-to-basic-SYRE ratio is ``d_bound ~ sigma_0``, which is
-why bf16's ~7-bit relative ulp swallows AR regardless of ``gamma``.
+* SYRE-AR is computed in **additive form** as ``diff + diff*xi`` rather
+  than ``diff*(1+xi)`` -- avoids an fp32 pigeonhole on the per-element
+  decay multiplier ``D_ii``. Full derivation is in the ``ADVANCED_REMOVAL``
+  branch of :func:`_syre_wd_kernel`.
+* The cautious-SYRE mask uses the *update direction* ``u``, not
+  ``(theta - theta_0)``. This matches the cautious-WD form already
+  shipped in :func:`dion.muon.muon_update_post_orthogonalize` -- it's
+  "cautious WD applied to SYRE", not "cautious applied to the SYRE
+  diff". See the ``U`` parameter docstring on :func:`syre_wd_inplace`.
+* Storage-dtype precision (fp32 vs. bf16) determines whether SYRE / AR
+  survive the writeback. fp32 storage works as the paper intends; bf16
+  storage attenuates basic SYRE and effectively no-ops AR. See the
+  "Storage-dtype precision" section of :func:`syre_wd_inplace`'s
+  docstring for the per-variant ulp accounting.
 """
 
 import math
@@ -246,17 +184,49 @@ def _syre_wd_kernel(
     diff = theta_f32 - theta_0
 
     if ADVANCED_REMOVAL:
-        # Additive form: compute diff*(1+xi) as diff + diff*xi rather
-        # than forming (1+xi) explicitly. xi lives near 0 with full
-        # fp32 precision (~1e7 distinct values in our window at typical
-        # d_bound); (1+xi) computed explicitly would round many distinct
-        # xi to the same fp32 value near 1.0 (ulp ~1.2e-7), collapsing
-        # AR to zero for ~half the elements. See module docstring
-        # "Pigeonhole avoidance" section for the full derivation.
+        # Additive form: compute ``diff * (1 + xi)`` as
+        # ``diff + diff * xi`` rather than forming ``(1 + xi)`` in fp32
+        # first. The two are algebraically identical; the rearrangement
+        # matters because of fp32 precision near 1.0.
+        #
+        # The paper requires the per-element decay multiplier ``D_ii =
+        # 1 + xi_i`` to be all distinct. The naive multiplicative form
+        # forms ``1 + xi`` in fp32. fp32 ulp at 1.0 is ~1.2e-7, so the
+        # window of representable ``(1 + xi)`` values for
+        # ``xi ~ Uniform(-d_bound, +d_bound)`` has only
+        # ``~2*d_bound / 1.2e-7`` distinct levels -- a few hundred at
+        # typical ``d_bound ~ 3e-5``. A real layer has millions of
+        # elements; by pigeonhole many elements collide to the same
+        # fp32 value, and ~half are rounded to *exactly* 1.0 (giving
+        # them zero AR contribution per step, not merely sub-ulp).
+        # That violates the paper's "all D_ii distinct" hypothesis at
+        # the implementation level.
+        #
+        # The additive form sidesteps this. ``xi`` lives in
+        # ``[-d_bound, +d_bound]`` near 0, where fp32 ulp at
+        # ``d_bound ~ 3e-5`` is ~1.2e-12, so the window admits
+        # ~5e7 distinct fp32 values -- enough to keep ``xi_i`` distinct
+        # per element well past typical layer sizes. ``diff * xi`` is a
+        # multiplication, which preserves the relative precision of
+        # ``xi`` (rounding happens at the product's magnitude, not near
+        # 1.0). ``diff + diff*xi`` then adds the contribution at
+        # ``diff``'s magnitude, where ulp is much smaller than ulp(1.0),
+        # so the contribution survives writeback.
+        #
+        # The mathematical distribution of the implicit ``D`` matrix
+        # is identical to the naive form; the rearrangement only
+        # changes which intermediates fp32 has to store.
         xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
         diff = diff + diff * xi
 
     if CAUTIOUS:
+        # Cautious-SYRE: mask source is the *update direction* ``u``
+        # (the post-orth / post-Adam step the optimizer is about to
+        # subtract from theta), not the SYRE diff itself. This is
+        # cautious-WD (https://arxiv.org/pdf/2510.12402) applied to
+        # SYRE -- decay only fires where ``u`` and ``theta`` agree in
+        # sign. AR composes with this: the AR multiplier above scales
+        # the diff *before* the mask zeros it out where signs disagree.
         u_f32 = tl.load(U_ptr + offsets, mask=mask).to(tl.float32)
         diff = tl.where(u_f32 * theta_f32 >= 0.0, diff, 0.0)
 
@@ -308,8 +278,44 @@ def syre_wd_inplace(
             single-process).
         U: optional update tensor (same shape as ``X``). When provided,
             the cautious mask ``(U * X >= 0)`` gates the SYRE diff
-            element-wise. When ``None`` (default), basic SYRE is
+            element-wise -- that is, the mask source is the *update
+            direction* the optimizer is about to apply, not the SYRE
+            diff itself. This is "cautious WD applied to SYRE", matching
+            :func:`dion.muon.muon_update_post_orthogonalize`'s
+            cautious-WD branch. When ``None`` (default), basic SYRE is
             applied. ``U`` is read but not modified.
+
+    Storage-dtype precision
+    -----------------------
+
+    The kernel does all arithmetic in fp32 (``theta_f32 =
+    theta.to(fp32)``) but writes the result back to ``X``'s storage
+    dtype. The storage dtype -- *not* the gradient dtype, autocast
+    context, or anything else upstream -- determines whether SYRE's
+    per-step contribution survives.
+
+    Rough order-of-magnitude with ``lr=3e-4``, ``wd=0.1``,
+    ``sigma_0 = 0.01/sqrt(d)``, weight magnitude ``~0.03``:
+
+    * **fp32 storage** (incl. fp32-master / bf16-grad mixed precision):
+      basic SYRE contributes ~250 fp32-ulps per step, AR contributes
+      ~8e-3 fp32-ulps per step. Basic SYRE registers cleanly; AR is
+      sub-ulp per step but accumulates deterministically (the per-
+      element AR multiplier is fixed by Philox seed, not redrawn step-
+      to-step), reaching ~80 ulps over one WD half-life. **Both behave
+      as the paper intends.**
+    * **bf16 storage** (pure-bf16 training, 8-bit optimizers holding
+      bf16 params): basic SYRE contributes ~4e-3 bf16-ulps per step --
+      still accumulates over long horizons under round-to-nearest-even,
+      but at heavily attenuated effective ``gamma``. AR contributes
+      ~1e-7 bf16-ulps per step and **never crosses 1 ulp at realistic
+      step counts** -- it is effectively a no-op. If you need SYRE/AR
+      to behave as documented, use fp32 master weights or stochastic
+      rounding on the writeback.
+
+    Numbers scale predictably with layer init magnitude and ``gamma``;
+    AR's signal-to-basic-SYRE ratio is ``d_bound ~ sigma_0``, which is
+    why bf16's ~7-bit relative ulp swallows AR regardless of ``gamma``.
     """
     numel = X.numel()
     if numel == 0 or gamma == 0.0:
@@ -409,7 +415,9 @@ def _syre_wd_multi_kernel(
     diff = theta_f32 - theta_0
 
     if ADVANCED_REMOVAL:
-        # See additive-form note in _syre_wd_kernel above.
+        # Additive form: see the full derivation in ``_syre_wd_kernel``
+        # above. Computed as ``diff + diff*xi`` rather than
+        # ``diff*(1+xi)`` to avoid an fp32 pigeonhole on ``D_ii``.
         xi = tl.rand(seed2, global_offsets) * (2.0 * d_bound) - d_bound
         diff = diff + diff * xi
 
